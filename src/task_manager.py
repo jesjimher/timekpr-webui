@@ -14,6 +14,9 @@ from src.database import (
     UserWeeklySchedule,
     UserDailyTimeInterval,
     coerce_time_spent_day,
+    GroupTimeAdjustment,
+    get_user_groups,
+    group_today_limit,
 )
 from src.ssh_helper import SSHClient
 
@@ -283,6 +286,95 @@ class BackgroundTaskManager:
                     # Continue with the next user, but make sure we commit any pending changes
                     db.session.rollback()
                     
+            # After processing all individual users, run cross-host reconciliation
+            self._reconcile_groups()
+
         except Exception as e:
             logger.error(f"Error in user data update: {str(e)}\n{traceback.format_exc()}")
             db.session.rollback()
+
+    # Minimum seconds drift between desired and actual time-left before we
+    # issue a settimeleft correction.  Keeps SSH traffic low while still
+    # converging quickly (one 10s cycle suffices for any reasonable activity).
+    _RECONCILE_THRESHOLD = 60  # seconds
+
+    def _reconcile_groups(self):
+        """Enforce the shared time pool across every multi-host username group.
+
+        For each group of ≥2 valid hosts that share a username:
+        1. Compute desired = group_today_limit - total_spent_today.
+        2. For every reachable host, if its TIME_LEFT_DAY deviates from
+           desired by more than _RECONCILE_THRESHOLD seconds, push a
+           relative adjustment via timekpra --settimeleft.
+
+        Single-host groups are untouched — they keep the existing per-host
+        pending_time_adjustment behaviour.
+        """
+        groups = get_user_groups()  # {username: [ManagedUser, ...]}
+        today = date.today()
+
+        for username, members in groups.items():
+            if len(members) < 2:
+                continue  # single-host: handled by existing per-host logic
+
+            try:
+                limit = group_today_limit(username)
+                if limit <= 0:
+                    logger.info("Group '%s': no daily limit set, skipping reconciliation", username)
+                    continue
+
+                total_spent = 0
+                for m in members:
+                    usage = UserTimeUsage.query.filter_by(user_id=m.id, date=today).first()
+                    total_spent += (usage.time_spent if usage else 0)
+
+                desired = max(0, limit - total_spent)
+                logger.info(
+                    "Group '%s': limit=%ds spent=%ds desired=%ds",
+                    username, limit, total_spent, desired,
+                )
+
+                for m in members:
+                    try:
+                        current_left = m.get_config_value('TIME_LEFT_DAY')
+                        if current_left is None:
+                            logger.info(
+                                "No TIME_LEFT_DAY cached for %s@%s, skipping this host",
+                                username, m.system_ip,
+                            )
+                            continue
+
+                        delta = desired - current_left
+                        if abs(delta) < self._RECONCILE_THRESHOLD:
+                            logger.info(
+                                "%s@%s: delta=%ds < threshold, no adjustment needed",
+                                username, m.system_ip, delta,
+                            )
+                            continue
+
+                        operation = '+' if delta > 0 else '-'
+                        amount = abs(delta)
+                        logger.info(
+                            "Reconciling %s@%s: %s%ds (current=%d desired=%d)",
+                            username, m.system_ip, operation, amount, current_left, desired,
+                        )
+                        ssh_client = SSHClient(hostname=m.system_ip)
+                        success, msg = ssh_client.modify_time_left(username, operation, amount)
+                        if success:
+                            logger.info("Reconciliation OK for %s@%s", username, m.system_ip)
+                        else:
+                            logger.warning(
+                                "Reconciliation failed for %s@%s: %s",
+                                username, m.system_ip, msg,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "Error reconciling %s@%s: %s",
+                            username, m.system_ip, e,
+                        )
+
+            except Exception as e:
+                logger.error(
+                    "Error reconciling group '%s': %s\n%s",
+                    username, e, traceback.format_exc(),
+                )

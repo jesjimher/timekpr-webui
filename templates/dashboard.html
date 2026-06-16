@@ -30,9 +30,8 @@
                 <a href="{{ url_for('logout') }}" class="btn btn-sm btn-danger">Logout</a>
             </div>
         </header>
-        
+
         <script>
-            // Function to update the task status indicator
             function updateTaskStatus() {
                 fetch('/api/task-status')
                     .then(response => response.json())
@@ -41,13 +40,9 @@
                             const container = document.getElementById('task-status-container');
                             const indicator = document.getElementById('task-status-indicator');
                             const status = data.status;
-                            
-                            // Show container only if there are issues
                             const hasIssues = !status.running || !status.thread_alive || status.last_error;
-                            
                             if (hasIssues) {
                                 container.style.display = 'flex';
-                                
                                 if (status.running && status.thread_alive) {
                                     indicator.className = 'status-active';
                                     indicator.textContent = 'Active';
@@ -55,68 +50,55 @@
                                     indicator.className = 'status-inactive';
                                     indicator.textContent = 'Inactive';
                                 }
-                                
-                                // Set tooltip to show last error if any
-                                if (status.last_error) {
-                                    indicator.title = `Last error: ${status.last_error.message} at ${status.last_error.time}`;
-                                } else {
-                                    indicator.title = 'Background tasks are running normally';
-                                }
+                                indicator.title = status.last_error
+                                    ? `Last error: ${status.last_error.message} at ${status.last_error.time}`
+                                    : 'Background tasks are running normally';
                             } else {
-                                // Hide container when everything is working fine
                                 container.style.display = 'none';
                             }
                         }
                     })
-                    .catch(error => {
-                        console.error('Error fetching task status:', error);
+                    .catch(() => {
                         const container = document.getElementById('task-status-container');
                         const indicator = document.getElementById('task-status-indicator');
-                        
-                        // Show container on API error
                         container.style.display = 'flex';
                         indicator.className = 'status-error';
                         indicator.textContent = 'Error';
-                        indicator.title = 'Error connecting to background task status API';
                     });
             }
-            
-            // Function to update sync status for all users
+
+            // Poll sync status for every group; update its badge
             function updateSyncStatus() {
-                {% for user in users %}
-                fetch('/api/schedule-sync-status/{{ user.id }}')
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            const statusBadge = document.getElementById('sync-status-{{ user.id }}');
-                            const syncIcon = document.getElementById('sync-icon-{{ user.id }}');
-                            const syncText = document.getElementById('sync-text-{{ user.id }}');
-                            
-                            if (!data.is_synced && data.schedule) {
-                                // Show "Schedule Not Synced" badge
-                                statusBadge.className = 'badge badge-warning sync-status-badge';
-                                statusBadge.style.display = 'block';
-                                syncIcon.setAttribute('d', 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z');
-                                syncText.textContent = 'Schedule Not Synced';
-                            } else {
-                                // Hide badge when synced or no schedule
-                                statusBadge.style.display = 'none';
-                            }
+                {% for group in groups %}
+                {
+                    const hostIds = {{ group.ids | tojson }};
+                    Promise.all(
+                        hostIds.map(id => fetch('/api/schedule-sync-status/' + id).then(r => r.json()))
+                    ).then(results => {
+                        const anyUnsynced = results.some(d => d.success && !d.is_synced && d.schedule);
+                        const badge    = document.getElementById('sync-status-{{ loop.index0 }}');
+                        const syncText = document.getElementById('sync-text-{{ loop.index0 }}');
+                        const syncIcon = document.getElementById('sync-icon-{{ loop.index0 }}');
+                        if (!badge) return;
+                        if (anyUnsynced) {
+                            badge.className = 'badge badge-warning sync-status-badge';
+                            badge.style.display = 'block';
+                            syncText.textContent = 'Schedule Not Synced';
+                            syncIcon.setAttribute('d', 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z');
+                        } else {
+                            badge.style.display = 'none';
                         }
-                    })
-                    .catch(error => {
-                        console.error('Error fetching sync status for user {{ user.id }}:', error);
-                    });
+                    }).catch(() => {});
+                }
                 {% endfor %}
             }
-            
-            // Check status immediately and then every 5 seconds
+
             updateTaskStatus();
             updateSyncStatus();
             setInterval(updateTaskStatus, 30000);
             setInterval(updateSyncStatus, 5000);
         </script>
-        
+
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
                 {% for category, message in messages %}
@@ -124,77 +106,93 @@
                 {% endfor %}
             {% endif %}
         {% endwith %}
-        
+
         <div class="users-grid">
-            {% if users %}
-                {% for user in users %}
+            {% if groups %}
+                {% for group in groups %}
                     <div class="user-card">
                         <div class="user-card-header">
                             <div class="user-info">
-                                <h2 class="user-name">{{ user.username }}</h2>
-                                <p class="user-location">{{ user.system_ip }}</p>
+                                <h2 class="user-name">{{ group.username }}</h2>
+                                <p class="user-location">
+                                    {%- for host in group.hosts -%}
+                                        {{ host.ip }}{% if not loop.last %}, {% endif %}
+                                    {%- endfor -%}
+                                </p>
                             </div>
                         </div>
                         <div class="user-card-body">
                             <div class="user-stats">
                                 <div class="stat-item">
                                     <div class="stat-label">Time Left Today</div>
-                                    <div class="stat-value">{{ user.time_left }}</div>
+                                    <div class="stat-value">{{ group.global_time_left }}</div>
                                 </div>
                                 <div class="stat-item">
                                     <div class="stat-label">Last Updated</div>
                                     <div class="stat-value">
-                                        {% if user.last_checked %}
-                                            {{ (user.last_checked|localtime).strftime('%H:%M') }}
+                                        {% if group.last_checked %}
+                                            {{ (group.last_checked|localtime).strftime('%H:%M') }}
                                         {% else %}
                                             Never
                                         {% endif %}
                                     </div>
                                 </div>
                             </div>
-                            
-                            {% if user.id|string in pending_adjustments %}
+
+                            {% if group.has_pending %}
                             <div class="badge badge-warning" style="margin-bottom: var(--space-4);">
                                 <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                     <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
                                 </svg>
-                                Pending: {{ pending_adjustments[user.id|string] }}
+                                Pending time adjustment
                             </div>
                             {% endif %}
-                            <div id="sync-status-{{ user.id }}" class="badge sync-status-badge" style="margin-bottom: var(--space-4); display: none;">
+
+                            <div id="sync-status-{{ loop.index0 }}"
+                                 class="badge sync-status-badge"
+                                 style="margin-bottom: var(--space-4); display: {{ 'block' if group.any_unsynced else 'none' }};">
                                 <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
-                                    <path id="sync-icon-{{ user.id }}" d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
+                                    <path id="sync-icon-{{ loop.index0 }}" d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
                                 </svg>
-                                <span id="sync-text-{{ user.id }}">Schedule Not Synced</span>
+                                <span id="sync-text-{{ loop.index0 }}">Schedule Not Synced</span>
                             </div>
-                            
+
                             <div class="user-actions">
-                                <button class="btn btn-primary" onclick="openTimeAdjustModal({{ user.id }}, '{{ user.username }}')">Adjust Time</button>
-                                <a href="{{ url_for('weekly_schedule_user', user_id=user.id) }}" class="btn btn-secondary">Schedule</a>
-                                <a href="{{ url_for('user_stats', user_id=user.id) }}" class="btn btn-secondary">History</a>
+                                <button class="btn btn-primary"
+                                        onclick="openTimeAdjustModal('{{ group.username | e }}')">
+                                    Adjust Time
+                                </button>
+                                <a href="{{ url_for('weekly_schedule_group', username=group.username) }}"
+                                   class="btn btn-secondary">Schedule</a>
+                                <a href="{{ url_for('group_stats', username=group.username) }}"
+                                   class="btn btn-secondary">History</a>
                             </div>
                         </div>
-                            
-                            <div class="user-chart">
-                                <h4 class="chart-title">Usage This Week</h4>
-                                <div class="chart-container">
-                                    <canvas id="chart-{{ user.id }}"></canvas>
-                                </div>
+
+                        <div class="user-chart">
+                            <h4 class="chart-title">Usage This Week</h4>
+                            <div class="chart-container">
+                                <canvas id="chart-{{ loop.index0 }}"></canvas>
+                            </div>
                         </div>
                     </div>
-                    
+
                     <script>
-                        (function() {
-                            window._chartData = window._chartData || {};
-                            const shortWeekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-                            const dates = [], labels = [], values = [];
-                            {% for date, time_spent in user.usage_data.items() %}
-                                dates.push('{{ date }}');
-                                labels.push(shortWeekdays[new Date('{{ date }}T00:00:00').getDay()]);
-                                values.push({{ time_spent / 3600 }});
-                            {% endfor %}
-                            window._chartData[{{ user.id }}] = { dates, labels, values };
-                        })();
+                    (function() {
+                        window._chartData = window._chartData || {};
+                        const dates = {{ group.dates | tojson }};
+                        const perHostValues = {};
+                        {% for phv in group.per_host_values %}
+                        perHostValues[{{ phv.ip | tojson }}] = {{ phv.hours | tojson }};
+                        {% endfor %}
+                        const hostKeys = {{ group.hosts | map(attribute='ip') | list | tojson }};
+                        window._chartData[{{ loop.index0 }}] = {
+                            dates,
+                            hostKeys,
+                            perHostValues,
+                            remainingTodayHours: {{ group.remaining_today_hours }},
+                        };
+                    })();
                     </script>
                 {% endfor %}
             {% else %}
@@ -208,121 +206,163 @@
     </div>
 
     <script>
-        (function() {
-            // Find the global max value across all stored chart data
-            const allValues = Object.values(window._chartData || {}).flatMap(d => d.values);
-            const globalMax = Math.max(...allValues, 1);
+    (function() {
+        const todayStr = new Date().toISOString().slice(0, 10);
+        const shortWeekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-            function calculateYAxisScale(maxValue) {
-                if (maxValue === 0) return { max: 1, stepSize: 0.5 };
-                const niceSteps = [0.1, 0.2, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12];
-                const maxIntervals = 6;
-                const minStepSize = maxValue / maxIntervals;
-                let stepSize = niceSteps.find(step => step >= minStepSize) || niceSteps[niceSteps.length - 1];
-                const max = Math.ceil(maxValue / stepSize) * stepSize;
-                return { max, stepSize };
+        // Colour palette for host datasets (up to 6 hosts)
+        const PALETTE = [
+            { bg: 'rgb(59 130 246 / 0.7)',  border: 'rgb(59 130 246)' },
+            { bg: 'rgb(16 185 129 / 0.7)',  border: 'rgb(16 185 129)' },
+            { bg: 'rgb(245 158 11 / 0.7)',  border: 'rgb(245 158 11)' },
+            { bg: 'rgb(239 68 68  / 0.7)',  border: 'rgb(239 68 68)' },
+            { bg: 'rgb(168 85 247 / 0.7)',  border: 'rgb(168 85 247)' },
+            { bg: 'rgb(236 72 153 / 0.7)',  border: 'rgb(236 72 153)' },
+        ];
+
+        // Compute global Y-max across all groups (stacked totals per day)
+        let globalMax = 1;
+        for (const data of Object.values(window._chartData || {})) {
+            const { dates, hostKeys, perHostValues, remainingTodayHours } = data;
+            for (let i = 0; i < dates.length; i++) {
+                let stackTotal = hostKeys.reduce((s, ip) => s + (perHostValues[ip][i] || 0), 0);
+                if (dates[i] === todayStr) stackTotal += remainingTodayHours;
+                globalMax = Math.max(globalMax, stackTotal);
             }
+        }
 
-            const { max: yAxisMax, stepSize } = calculateYAxisScale(globalMax);
+        function calculateYAxisScale(maxValue) {
+            if (maxValue === 0) return { max: 1, stepSize: 0.5 };
+            const niceSteps = [0.1, 0.2, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12];
+            const minStepSize = maxValue / 6;
+            const stepSize = niceSteps.find(s => s >= minStepSize) || niceSteps[niceSteps.length - 1];
+            return { max: Math.ceil(maxValue / stepSize) * stepSize, stepSize };
+        }
 
-            function getWeekdayName(dateStr) {
-                const date = new Date(dateStr + 'T00:00:00');
-                return ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][date.getDay()];
-            }
+        const { max: yAxisMax, stepSize } = calculateYAxisScale(globalMax);
 
-            for (const [userId, data] of Object.entries(window._chartData || {})) {
-                const canvas = document.getElementById('chart-' + userId);
-                if (!canvas) continue;
-                const ctx = canvas.getContext('2d');
-                const { dates, labels, values } = data;
+        function fmtHours(h) {
+            if (h === 0) return '0h';
+            if (h < 1) return Math.round(h * 60) + 'm';
+            if (h % 1 === 0) return h + 'h';
+            return Math.floor(h) + 'h ' + Math.round((h % 1) * 60) + 'm';
+        }
 
-                new Chart(ctx, {
-                    type: 'bar',
-                    data: {
-                        labels: labels,
-                        datasets: [{
-                            label: 'Hours Used',
-                            data: values,
-                            backgroundColor: function(context) {
-                                const weekday = labels[context.dataIndex];
-                                return (weekday === 'Sat' || weekday === 'Sun')
-                                    ? 'rgb(245 158 11 / 0.6)'
-                                    : 'rgb(59 130 246 / 0.6)';
+        function getWeekdayName(dateStr) {
+            const d = new Date(dateStr + 'T00:00:00');
+            return ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getDay()];
+        }
+
+        for (const [gidx, data] of Object.entries(window._chartData || {})) {
+            const canvas = document.getElementById('chart-' + gidx);
+            if (!canvas) continue;
+            const ctx = canvas.getContext('2d');
+            const { dates, hostKeys, perHostValues, remainingTodayHours } = data;
+            const labels = dates.map(d => shortWeekdays[new Date(d + 'T00:00:00').getDay()]);
+
+            // One stacked dataset per host
+            const datasets = hostKeys.map((ip, i) => ({
+                label: ip,
+                data: perHostValues[ip],
+                backgroundColor: (PALETTE[i % PALETTE.length] || PALETTE[0]).bg,
+                borderColor:     (PALETTE[i % PALETTE.length] || PALETTE[0]).border,
+                borderWidth: 2,
+                borderRadius: 0,
+                borderSkipped: false,
+                stack: 'usage',
+            }));
+
+            // Remaining-today segment (top of today's bar only)
+            const remainingData = dates.map(d => d === todayStr ? remainingTodayHours : 0);
+            datasets.push({
+                label: 'Remaining Today',
+                data: remainingData,
+                backgroundColor: 'rgb(226 232 240 / 0.35)',
+                borderColor: 'rgb(203 213 225 / 0.6)',
+                borderWidth: 1,
+                borderRadius: 6,
+                borderSkipped: false,
+                stack: 'usage',
+            });
+
+            const isMultiHost = hostKeys.length > 1;
+            const hasRemaining = remainingTodayHours > 0;
+
+            new Chart(ctx, {
+                type: 'bar',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { intersect: false, mode: 'index' },
+                    scales: {
+                        y: {
+                            stacked: true,
+                            beginAtZero: true,
+                            max: yAxisMax,
+                            ticks: {
+                                stepSize,
+                                color: 'rgb(100 116 139)',
+                                font: { size: 11 },
+                                callback: v => fmtHours(v),
                             },
-                            borderColor: function(context) {
-                                const weekday = labels[context.dataIndex];
-                                return (weekday === 'Sat' || weekday === 'Sun')
-                                    ? 'rgb(245 158 11)'
-                                    : 'rgb(59 130 246)';
+                            title: {
+                                display: true,
+                                text: 'Hours',
+                                color: 'rgb(100 116 139)',
+                                font: { size: 12, weight: '500' },
                             },
-                            borderWidth: 2,
-                            borderRadius: 6,
-                            borderSkipped: false
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        interaction: { intersect: false, mode: 'index' },
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                max: yAxisMax,
-                                ticks: {
-                                    stepSize: stepSize,
-                                    color: 'rgb(100 116 139)',
-                                    font: { size: 11 },
-                                    callback: function(value) {
-                                        if (value === 0) return '0h';
-                                        if (value < 1) return Math.round(value * 60) + 'm';
-                                        if (value % 1 === 0) return value + 'h';
-                                        return Math.floor(value) + 'h' + Math.round((value % 1) * 60) + 'm';
-                                    }
-                                },
-                                title: {
-                                    display: true,
-                                    text: 'Hours',
-                                    color: 'rgb(100 116 139)',
-                                    font: { size: 12, weight: '500' }
-                                },
-                                grid: { color: 'rgb(226 232 240 / 0.5)' }
-                            },
-                            x: {
-                                grid: { display: false },
-                                ticks: {
-                                    color: function(context) {
-                                        const weekday = labels[context.index];
-                                        return (weekday === 'Sat' || weekday === 'Sun')
-                                            ? 'rgb(245 158 11)'
-                                            : 'rgb(100 116 139)';
-                                    },
-                                    font: { size: 12, weight: '600' }
-                                }
-                            }
+                            grid: { color: 'rgb(226 232 240 / 0.5)' },
                         },
-                        plugins: {
-                            legend: { display: false },
-                            tooltip: {
-                                callbacks: {
-                                    title: function(context) {
-                                        const index = context[0].dataIndex;
-                                        return getWeekdayName(dates[index]) + ' (' + dates[index] + ')';
-                                    },
-                                    label: function(context) {
-                                        const hours = context.parsed.y;
-                                        const wholeHours = Math.floor(hours);
-                                        const minutes = Math.round((hours % 1) * 60);
-                                        return wholeHours + 'h ' + minutes + 'm';
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        })();
+                        x: {
+                            stacked: true,
+                            grid: { display: false },
+                            ticks: {
+                                color: function(context) {
+                                    const w = labels[context.index];
+                                    return (w === 'Sat' || w === 'Sun')
+                                        ? 'rgb(245 158 11)'
+                                        : 'rgb(100 116 139)';
+                                },
+                                font: { size: 12, weight: '600' },
+                            },
+                        },
+                    },
+                    plugins: {
+                        legend: {
+                            display: isMultiHost || hasRemaining,
+                            position: 'bottom',
+                            labels: {
+                                boxWidth: 12,
+                                padding: 8,
+                                color: 'rgb(100 116 139)',
+                                font: { size: 11 },
+                                // Hide the remaining segment from legend if only 1 host
+                                filter: function(item) {
+                                    if (!isMultiHost && item.text === 'Remaining Today') return false;
+                                    return true;
+                                },
+                            },
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(context) {
+                                    const idx = context[0].dataIndex;
+                                    return getWeekdayName(dates[idx]) + ' (' + dates[idx] + ')';
+                                },
+                                label: function(context) {
+                                    const h = context.parsed.y;
+                                    return context.dataset.label + ': ' + fmtHours(h);
+                                },
+                            },
+                        },
+                    },
+                },
+            });
+        }
+    })();
     </script>
-    
+
     <!-- Time Adjustment Modal -->
     <div id="timeAdjustModal" class="modal">
         <div class="modal-content">
@@ -338,7 +378,6 @@
                 <p style="text-align: center; margin-bottom: var(--space-6);">
                     Current adjustment: <strong id="timeAdjustment" style="font-size: var(--font-size-lg);">0</strong> minutes
                 </p>
-                
                 <div class="time-controls">
                     <button class="btn btn-secondary" onclick="adjustTime(-15)">
                         <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
@@ -354,7 +393,6 @@
                         +15m
                     </button>
                 </div>
-                
                 <div id="modalStatus" style="text-align: center; margin: var(--space-4) 0; min-height: 20px;"></div>
             </div>
             <div class="modal-footer">
@@ -363,7 +401,7 @@
             </div>
         </div>
     </div>
-    
+
     <!-- Notification Toast -->
     <div id="notification-toast" class="notification-toast">
         <div class="toast-content">
@@ -373,7 +411,7 @@
             <span class="toast-message">Changes saved successfully!</span>
         </div>
     </div>
-    
+
     <style>
         .notification-toast {
             position: fixed;
@@ -389,165 +427,96 @@
             z-index: 1000;
             max-width: 300px;
         }
-        
-        .notification-toast.show {
-            transform: translateX(0);
-        }
-        
-        .notification-toast.success {
-            border-left: 4px solid var(--success);
-        }
-        
-        .notification-toast.error {
-            border-left: 4px solid var(--danger);
-        }
-        
-        .toast-content {
-            display: flex;
-            align-items: center;
-            gap: var(--space-3);
-        }
-        
-        .toast-icon {
-            flex-shrink: 0;
-        }
-        
-        .notification-toast.success .toast-icon {
-            color: var(--success);
-        }
-        
-        .notification-toast.error .toast-icon {
-            color: var(--danger);
-        }
-        
-        .toast-message {
-            font-weight: 500;
-            color: var(--text-primary);
-            font-size: var(--font-size-sm);
-        }
+        .notification-toast.show  { transform: translateX(0); }
+        .notification-toast.success { border-left: 4px solid var(--success); }
+        .notification-toast.error   { border-left: 4px solid var(--danger); }
+        .toast-content { display: flex; align-items: center; gap: var(--space-3); }
+        .toast-icon { flex-shrink: 0; }
+        .notification-toast.success .toast-icon { color: var(--success); }
+        .notification-toast.error   .toast-icon { color: var(--danger); }
+        .toast-message { font-weight: 500; color: var(--text-primary); font-size: var(--font-size-sm); }
     </style>
-    
+
     <script>
-        // Notification functions
         function showNotification(message, type = 'success') {
             const toast = document.getElementById('notification-toast');
             const messageEl = toast.querySelector('.toast-message');
             const iconEl = toast.querySelector('.toast-icon path');
-            
-            // Set message
             messageEl.textContent = message;
-            
-            // Set type and icon
             toast.className = `notification-toast ${type}`;
             if (type === 'success') {
                 iconEl.setAttribute('d', 'M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.061L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z');
-            } else if (type === 'error') {
+            } else {
                 iconEl.setAttribute('d', 'M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z');
             }
-            
-            // Show toast
             toast.classList.add('show');
-            
-            // Hide after 2 seconds
-            setTimeout(() => {
-                toast.classList.remove('show');
-            }, 2000);
+            setTimeout(() => toast.classList.remove('show'), 2500);
         }
-        
-        // Time adjustment modal variables
-        let currentUserId = null;
-        let currentUsername = '';
-        let timeAdjustment = 0; // in minutes
-        
-        // Function to open the time adjustment modal
-        function openTimeAdjustModal(userId, username) {
-            currentUserId = userId;
+
+        // Modal state
+        let currentUsername = null;
+        let timeAdjustment = 0;
+
+        function openTimeAdjustModal(username) {
             currentUsername = username;
             document.getElementById('modalUsername').textContent = username;
             resetTime();
             document.getElementById('timeAdjustModal').style.display = 'block';
         }
-        
-        // Function to close the modal
+
         function closeTimeAdjustModal() {
             document.getElementById('timeAdjustModal').style.display = 'none';
             document.getElementById('modalStatus').textContent = '';
-            document.getElementById('modalStatus').className = 'modal-status';
         }
-        
-        // Function to adjust time
+
         function adjustTime(minutes) {
             timeAdjustment += minutes;
             updateTimeDisplay();
         }
-        
-        // Function to reset time adjustment
+
         function resetTime() {
             timeAdjustment = 0;
             updateTimeDisplay();
         }
-        
-        // Function to update the time display
+
         function updateTimeDisplay() {
             const display = document.getElementById('timeAdjustment');
             display.textContent = timeAdjustment;
-            
-            // Update color based on value
-            if (timeAdjustment > 0) {
-                display.style.color = 'var(--success)';
-            } else if (timeAdjustment < 0) {
-                display.style.color = 'var(--danger)';
-            } else {
-                display.style.color = 'var(--text-primary)';
-            }
+            display.style.color = timeAdjustment > 0
+                ? 'var(--success)'
+                : timeAdjustment < 0 ? 'var(--danger)' : 'var(--text-primary)';
         }
-        
-        // Function to submit the time adjustment
+
         function submitTimeAdjustment() {
             if (timeAdjustment === 0) {
                 showNotification('No time adjustment specified', 'error');
                 return;
             }
-            
-            const seconds = timeAdjustment * 60; // Convert minutes to seconds
-            const operation = seconds > 0 ? '+' : '-';
-            const absoluteSeconds = Math.abs(seconds);
-            
-            // Show loading status
+            const seconds = Math.abs(timeAdjustment * 60);
+            const operation = timeAdjustment > 0 ? '+' : '-';
             const statusEl = document.getElementById('modalStatus');
             statusEl.textContent = 'Applying changes...';
-            statusEl.className = 'modal-status status-loading';
-            
-            // Create form data
+
             const formData = new FormData();
-            formData.append('user_id', currentUserId);
             formData.append('operation', operation);
-            formData.append('seconds', absoluteSeconds);
-            
-            // Send request to server
-            fetch('/api/modify-time', {
+            formData.append('seconds', seconds);
+
+            fetch(`/api/group/${encodeURIComponent(currentUsername)}/adjust-pool`, {
                 method: 'POST',
-                body: formData
+                body: formData,
             })
-            .then(response => response.json())
+            .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    statusEl.textContent = 'Success! Time adjusted successfully.';
-                    statusEl.className = 'modal-status status-success';
-                    
-                    // Refresh the page after 1.5 seconds
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 1500);
+                    statusEl.textContent = data.message || 'Done!';
+                    if (data.refresh) {
+                        setTimeout(() => window.location.reload(), 1500);
+                    }
                 } else {
-                    statusEl.textContent = `Error: ${data.message}`;
-                    statusEl.className = 'modal-status status-error';
+                    statusEl.textContent = 'Error: ' + data.message;
                 }
             })
-            .catch(error => {
-                statusEl.textContent = `Error: ${error.message}`;
-                statusEl.className = 'modal-status status-error';
-            });
+            .catch(err => { statusEl.textContent = 'Error: ' + err.message; });
         }
     </script>
 </body>

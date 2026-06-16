@@ -1,5 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import json
 import bcrypt
 
@@ -202,6 +202,63 @@ class ManagedUser(db.Model):
             label = datetime(year, month, 1).strftime('%b %Y')
             result.append({'label': label, 'month': key, 'total': buckets[key]})
         return result
+
+
+class GroupTimeAdjustment(db.Model):
+    """Per-day manual pool adjustment for a username group (signed seconds).
+
+    Created when the user clicks "Adjust Time" on a multi-host group card.
+    The reconciliation loop reads this and adds extra_seconds to the computed
+    remaining pool before enforcing it on every host.
+    """
+    __tablename__ = 'group_time_adjustment'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), nullable=False)
+    date = db.Column(db.Date, nullable=False)
+    extra_seconds = db.Column(db.Integer, default=0)  # positive = bonus, negative = penalty
+
+    __table_args__ = (
+        db.UniqueConstraint('username', 'date', name='group_user_date_uc'),
+    )
+
+    def __repr__(self):
+        return f'<GroupTimeAdjustment {self.username} {self.date}: {self.extra_seconds:+d}s>'
+
+
+def get_user_groups():
+    """Return {username: [ManagedUser, ...]} for all valid users, grouped by username."""
+    users = ManagedUser.query.filter_by(is_valid=True).all()
+    groups: dict = {}
+    for u in users:
+        groups.setdefault(u.username, []).append(u)
+    return groups
+
+
+def group_today_limit(username):
+    """Return today's global time limit in seconds for *username* group.
+
+    Returns 0 if no positive time limit is configured for today (unlimited).
+    Includes any GroupTimeAdjustment bonus/penalty recorded for today.
+    """
+    today = date.today()
+    day_key = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'][today.weekday()]
+
+    members = ManagedUser.query.filter_by(username=username).all()
+    base_hours = 0.0
+    for m in members:
+        if m.weekly_schedule:
+            h = m.weekly_schedule.get_schedule_dict().get(day_key, 0) or 0
+            if h > 0:
+                base_hours = float(h)
+                break
+
+    if base_hours <= 0:
+        return 0
+
+    base_seconds = int(base_hours * 3600)
+    adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
+    extra = adj.extra_seconds if adj else 0
+    return max(0, base_seconds + extra)
 
     def get_config_value(self, key):
         """Extract a specific value from the stored config"""

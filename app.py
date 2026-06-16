@@ -13,6 +13,8 @@ from src.database import (
     UserWeeklySchedule,
     UserDailyTimeInterval,
     coerce_time_spent_day,
+    GroupTimeAdjustment,
+    group_today_limit,
 )
 from src.ssh_helper import SSHClient
 from src.task_manager import BackgroundTaskManager
@@ -93,49 +95,102 @@ def dashboard():
     if not session.get('logged_in'):
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
-    
-    # Get all valid users - make sure we're getting fresh data by expiring SQLAlchemy's cache
+
+    # Bust SQLAlchemy cache so we see freshly-committed usage data
     db.session.expire_all()
-    users = ManagedUser.query.filter_by(is_valid=True).all()
-    
-    # Track users with pending time adjustments
-    pending_adjustments = {}
-    
-    # Prepare user data for the dashboard
-    user_data = []
-    for user in users:
-        # Get usage data for charts
-        usage_data = user.get_recent_usage(days=7)
-        
-        # Get time left today if available
-        time_left = user.get_config_value('TIME_LEFT_DAY')
-        if time_left is not None:
-            time_left_hours = time_left // 3600
-            time_left_minutes = (time_left % 3600) // 60
-            time_left_formatted = f"{time_left_hours}h {time_left_minutes}m"
+    all_users = ManagedUser.query.filter_by(is_valid=True).all()
+
+    # Group users by username (same name on multiple hosts → one card)
+    username_groups: dict = {}
+    for u in all_users:
+        username_groups.setdefault(u.username, []).append(u)
+
+    today = date.today()
+    groups = []
+
+    for username, members in sorted(username_groups.items()):
+        # --- Usage data per host (7 days) ---
+        host_usage = {}  # ip → {date_str: seconds}
+        for m in members:
+            host_usage[m.system_ip] = m.get_recent_usage(days=7)
+
+        # Ordered date strings (all members share the same 7-day window)
+        dates = list(list(host_usage.values())[0].keys()) if host_usage else []
+
+        # Per-host hour arrays aligned to `dates`
+        per_host_values = [
+            {
+                'ip': m.system_ip,
+                'hours': [host_usage.get(m.system_ip, {}).get(d, 0) / 3600.0 for d in dates],
+            }
+            for m in members
+        ]
+
+        # --- Global time-left for the group ---
+        limit_seconds = group_today_limit(username)
+        total_spent_today = sum(
+            (UserTimeUsage.query.filter_by(user_id=m.id, date=today).first() or
+             type('_', (), {'time_spent': 0})()).time_spent
+            for m in members
+        )
+
+        if limit_seconds > 0:
+            remaining = max(0, limit_seconds - total_spent_today)
+            h, m_rem = divmod(remaining, 3600)
+            global_time_left = f"{h}h {m_rem // 60}m"
+            remaining_today_hours = remaining / 3600.0
+        elif len(members) == 1:
+            # Single-host, no group limit — fall back to host's own TIME_LEFT_DAY
+            tl = members[0].get_config_value('TIME_LEFT_DAY')
+            if tl is not None:
+                h, m_rem = divmod(tl, 3600)
+                global_time_left = f"{h}h {m_rem // 60}m"
+            else:
+                global_time_left = "Unknown"
+            remaining_today_hours = 0.0
         else:
-            time_left_formatted = "Unknown"
-        
-        # Do NOT format last_checked time - pass the datetime object directly
-        # So the template can format it
-        
-        # Check for pending time adjustments
-        if user.pending_time_adjustment is not None and user.pending_time_operation is not None:
-            minutes = user.pending_time_adjustment // 60
-            operation = user.pending_time_operation
-            pending_adjustments[str(user.id)] = f"{operation}{minutes} minutes"
-        
-        user_data.append({
-            'id': user.id,
-            'username': user.username,
-            'system_ip': user.system_ip,
-            'last_checked': user.last_checked,  # Keep as datetime object
-            'usage_data': usage_data,
-            'time_left': time_left_formatted,
-            'weekly_schedule': user.weekly_schedule
+            global_time_left = "No limit"
+            remaining_today_hours = 0.0
+
+        # --- Most-recent update time across all hosts ---
+        checked_times = [m.last_checked for m in members if m.last_checked]
+        last_checked = max(checked_times) if checked_times else None
+
+        # --- Pending pool adjustment flag ---
+        pool_adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
+        has_pending = bool(pool_adj and pool_adj.extra_seconds != 0)
+        if not has_pending and len(members) == 1:
+            has_pending = bool(
+                members[0].pending_time_adjustment is not None and
+                members[0].pending_time_operation is not None
+            )
+
+        # --- Sync status (initial, updated by JS polling) ---
+        any_unsynced = False
+        for m in members:
+            if m.weekly_schedule and not m.weekly_schedule.is_synced:
+                any_unsynced = True
+                break
+            if UserDailyTimeInterval.query.filter_by(user_id=m.id, is_synced=False).first():
+                any_unsynced = True
+                break
+
+        groups.append({
+            'username': username,
+            'hosts': [{'id': m.id, 'ip': m.system_ip} for m in members],
+            'ids': [m.id for m in members],
+            'primary_user_id': members[0].id,
+            'dates': dates,
+            'per_host_values': per_host_values,
+            'remaining_today_hours': remaining_today_hours,
+            'global_time_left': global_time_left,
+            'last_checked': last_checked,
+            'has_pending': has_pending,
+            'any_unsynced': any_unsynced,
+            'is_multi_host': len(members) > 1,
         })
-    
-    return render_template('dashboard.html', users=user_data, pending_adjustments=pending_adjustments)
+
+    return render_template('dashboard.html', groups=groups)
 
 @app.route('/admin')
 def admin():
@@ -250,29 +305,48 @@ def add_user():
     
     if is_valid and config_dict:
         new_user.last_config = json.dumps(config_dict)
-        
+
         # Add the user to get an ID first
         db.session.add(new_user)
         db.session.commit()
-        
+
         # Add today's usage data
         today = date.today()
         time_spent = coerce_time_spent_day(config_dict.get('TIME_SPENT_DAY', 0))
-        
-        usage = UserTimeUsage(
-            user_id=new_user.id,
-            date=today,
-            time_spent=time_spent
-        )
+        usage = UserTimeUsage(user_id=new_user.id, date=today, time_spent=time_spent)
         db.session.add(usage)
+
+        # Inherit group schedule/intervals if other hosts already exist for this username
+        existing_peers = ManagedUser.query.filter(
+            ManagedUser.username == username,
+            ManagedUser.id != new_user.id,
+        ).all()
+        for peer in existing_peers:
+            if peer.weekly_schedule:
+                sched = UserWeeklySchedule(user_id=new_user.id)
+                sched.set_schedule_from_dict(peer.weekly_schedule.get_schedule_dict())
+                db.session.add(sched)
+                for interval in peer.time_intervals:
+                    new_ivl = UserDailyTimeInterval(
+                        user_id=new_user.id,
+                        day_of_week=interval.day_of_week,
+                        start_hour=interval.start_hour,
+                        start_minute=interval.start_minute,
+                        end_hour=interval.end_hour,
+                        end_minute=interval.end_minute,
+                        is_enabled=interval.is_enabled,
+                        is_synced=False,
+                    )
+                    db.session.add(new_ivl)
+                break  # one peer's schedule is enough
+
         db.session.commit()
-        
         flash(f'User {username} added and validated successfully', 'success')
     else:
         db.session.add(new_user)
         db.session.commit()
         flash(f'User {username} added but validation failed: {message}', 'warning')
-    
+
     return redirect(url_for('admin'))
 
 @app.route('/users/validate/<int:user_id>')
@@ -362,77 +436,123 @@ def get_user_usage(user_id):
 
 @app.route('/weekly-schedule/<int:user_id>')
 def weekly_schedule_user(user_id):
-    """Display weekly schedule management page for a specific user"""
+    """Display weekly schedule management page for a single host (legacy / admin use)."""
     if not session.get('logged_in'):
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
-    
-    # Get the specific user
+
     user = ManagedUser.query.get_or_404(user_id)
-    
-    # Ensure the user has a weekly schedule record
+
     if not user.weekly_schedule:
         schedule = UserWeeklySchedule(user_id=user.id)
         db.session.add(schedule)
         db.session.commit()
-    
-    return render_template('weekly_schedule_single.html', user=user)
+
+    return render_template(
+        'weekly_schedule_single.html',
+        user=user,
+        group_username='',
+        member_ids=[user.id],
+        hosts_str=user.system_ip,
+    )
+
+
+@app.route('/weekly-schedule/group/<username>')
+def weekly_schedule_group(username):
+    """Display weekly schedule management page for a username group."""
+    if not session.get('logged_in'):
+        flash('Please login first', 'warning')
+        return redirect(url_for('login'))
+
+    members = ManagedUser.query.filter_by(username=username).all()
+    if not members:
+        flash(f'No users found with username {username}', 'danger')
+        return redirect(url_for('dashboard'))
+
+    # Use first member as the representative (form values, interval loading)
+    user = members[0]
+    if not user.weekly_schedule:
+        schedule = UserWeeklySchedule(user_id=user.id)
+        db.session.add(schedule)
+        db.session.commit()
+
+    member_ids = [m.id for m in members]
+    hosts_str = ', '.join(m.system_ip for m in members)
+
+    return render_template(
+        'weekly_schedule_single.html',
+        user=user,
+        group_username=username,
+        member_ids=member_ids,
+        hosts_str=hosts_str,
+    )
 
 @app.route('/weekly-schedule/update', methods=['POST'])
 def update_weekly_schedule():
-    """Update weekly schedule for a user"""
+    """Update weekly schedule — fans out to all group members when group_username is set."""
     if not session.get('logged_in'):
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
+
+    days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+    schedule_data = {}
+    for day in days:
+        try:
+            hours = float(request.form.get(day, '0'))
+            hours = max(0.0, min(24.0, hours))
+        except (ValueError, TypeError):
+            hours = 0.0
+        schedule_data[day] = hours
+
+    group_username = request.form.get('group_username', '').strip()
+
+    if group_username:
+        # Fan out to every host with this username
+        members = ManagedUser.query.filter_by(username=group_username).all()
+        if not members:
+            flash(f'No users found for {group_username}', 'danger')
+            return redirect(url_for('dashboard'))
+        try:
+            for m in members:
+                if not m.weekly_schedule:
+                    sched = UserWeeklySchedule(user_id=m.id)
+                    db.session.add(sched)
+                    db.session.flush()
+                    m.weekly_schedule = sched
+                m.weekly_schedule.set_schedule_from_dict(schedule_data)
+            db.session.commit()
+            flash(f'Weekly schedule updated for all hosts of {group_username}', 'success')
+        except Exception as e:
+            db.session.rollback()
+            flash(f'Error updating schedule: {str(e)}', 'danger')
+        return redirect(url_for('weekly_schedule_group', username=group_username))
+
+    # Single-host fallback
     user_id = request.form.get('user_id')
-    
     if not user_id:
         flash('User ID is required', 'danger')
-        return redirect(url_for('weekly_schedule'))
-    
+        return redirect(url_for('dashboard'))
     try:
         user_id = int(user_id)
     except ValueError:
         flash('Invalid user ID', 'danger')
-        return redirect(url_for('weekly_schedule'))
-    
+        return redirect(url_for('dashboard'))
+
     user = ManagedUser.query.get_or_404(user_id)
-    
-    # Get schedule data from form
-    schedule_data = {}
-    days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-    
-    for day in days:
-        hours = request.form.get(day, '0')
-        try:
-            hours = float(hours)
-            if hours < 0:
-                hours = 0
-            elif hours > 24:
-                hours = 24
-        except (ValueError, TypeError):
-            hours = 0
-        schedule_data[day] = hours  # Store as float hours to support fractional hours
-    
-    # Get or create weekly schedule
     if not user.weekly_schedule:
         schedule = UserWeeklySchedule(user_id=user.id)
         db.session.add(schedule)
-        db.session.flush()  # Get the ID
+        db.session.flush()
         user.weekly_schedule = schedule
     else:
         schedule = user.weekly_schedule
-    
-    # Update the schedule
+
     schedule.set_schedule_from_dict(schedule_data)
-    
     try:
         db.session.commit()
         flash(f'Weekly schedule updated for {user.username}', 'success')
     except Exception as e:
         db.session.rollback()
         flash(f'Error updating schedule: {str(e)}', 'danger')
-    
     return redirect(url_for('weekly_schedule_user', user_id=user.id))
 
 @app.route('/api/user/<int:user_id>/intervals')
@@ -608,20 +728,79 @@ def get_schedule_sync_status(user_id):
 
 @app.route('/stats/<int:user_id>')
 def user_stats(user_id):
-    """Display extended usage history for a single user"""
+    """Display extended usage history for a single host."""
     if not session.get('logged_in'):
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
 
     user = ManagedUser.query.get_or_404(user_id)
-
-    daily_30   = user.get_recent_usage(days=30)
-    weekly_13  = user.get_usage_weekly_grouped(weeks=13)
-    monthly_12 = user.get_usage_monthly_grouped(months=12)
-    all_monthly = user.get_all_usage_monthly()
-
     return render_template('stats.html',
         user=user,
+        daily_30=user.get_recent_usage(days=30),
+        weekly_13=user.get_usage_weekly_grouped(weeks=13),
+        monthly_12=user.get_usage_monthly_grouped(months=12),
+        all_monthly=user.get_all_usage_monthly(),
+    )
+
+
+@app.route('/stats/group/<username>')
+def group_stats(username):
+    """Display aggregated usage history across all hosts of a username group."""
+    if not session.get('logged_in'):
+        flash('Please login first', 'warning')
+        return redirect(url_for('login'))
+
+    members = ManagedUser.query.filter_by(username=username).all()
+    if not members:
+        flash(f'No users found with username {username}', 'danger')
+        return redirect(url_for('dashboard'))
+
+    from collections import defaultdict
+
+    # daily_30: sum seconds per date across all hosts
+    daily_30: dict = {}
+    for m in members:
+        for d, s in m.get_recent_usage(days=30).items():
+            daily_30[d] = daily_30.get(d, 0) + s
+    daily_30 = dict(sorted(daily_30.items()))
+
+    # weekly_13
+    weekly_map: dict = {}
+    for m in members:
+        for w in m.get_usage_weekly_grouped(weeks=13):
+            k = w['week_start']
+            if k not in weekly_map:
+                weekly_map[k] = {'label': w['label'], 'week_start': k, 'total': 0}
+            weekly_map[k]['total'] += w['total']
+    weekly_13 = [weekly_map[k] for k in sorted(weekly_map)]
+
+    # monthly_12
+    monthly_map: dict = {}
+    for m in members:
+        for mo in m.get_usage_monthly_grouped(months=12):
+            k = mo['month']
+            if k not in monthly_map:
+                monthly_map[k] = {'label': mo['label'], 'month': k, 'total': 0}
+            monthly_map[k]['total'] += mo['total']
+    monthly_12 = [monthly_map[k] for k in sorted(monthly_map)]
+
+    # all_monthly
+    allmo_map: dict = {}
+    for m in members:
+        for mo in m.get_all_usage_monthly():
+            k = mo['month']
+            if k not in allmo_map:
+                allmo_map[k] = {'label': mo['label'], 'month': k, 'total': 0}
+            allmo_map[k]['total'] += mo['total']
+    all_monthly = [allmo_map[k] for k in sorted(allmo_map)]
+
+    from types import SimpleNamespace
+    stats_user = SimpleNamespace(
+        username=username,
+        system_ip=', '.join(m.system_ip for m in members),
+    )
+    return render_template('stats.html',
+        user=stats_user,
         daily_30=daily_30,
         weekly_13=weekly_13,
         monthly_12=monthly_12,
@@ -693,6 +872,83 @@ def modify_time():
             'refresh': True
         })
 
+@app.route('/api/group/<username>/adjust-pool', methods=['POST'])
+def group_adjust_pool(username):
+    """Add or subtract time from the shared pool for a username group.
+
+    For single-host groups the request is forwarded immediately to the host
+    (with pending-retry on failure).  For multi-host groups a
+    GroupTimeAdjustment record is created/updated; the reconciliation loop
+    will propagate the change to all hosts within the next 10 s cycle.
+    """
+    if not session.get('logged_in'):
+        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
+
+    operation = request.form.get('operation')
+    seconds_str = request.form.get('seconds')
+
+    if not operation or not seconds_str:
+        return jsonify({'success': False, 'message': 'Missing required parameters'}), 400
+    if operation not in ['+', '-']:
+        return jsonify({'success': False, 'message': "Operation must be '+' or '-'"}), 400
+    try:
+        seconds = int(seconds_str)
+    except ValueError:
+        return jsonify({'success': False, 'message': 'Invalid seconds value'}), 400
+
+    members = ManagedUser.query.filter_by(username=username, is_valid=True).all()
+    if not members:
+        return jsonify({'success': False, 'message': f'No valid users found for {username}'}), 404
+
+    today = date.today()
+
+    if len(members) == 1:
+        # Single-host: use existing direct SSH + pending fallback
+        user = members[0]
+        ssh_client = SSHClient(hostname=user.system_ip)
+        success, message = ssh_client.modify_time_left(username, operation, seconds)
+        if success:
+            is_valid, _, config_dict = ssh_client.validate_user(username)
+            if is_valid and config_dict:
+                user.last_checked = datetime.utcnow()
+                user.last_config = json.dumps(config_dict)
+                user.pending_time_adjustment = None
+                user.pending_time_operation = None
+                db.session.commit()
+            return jsonify({'success': True, 'message': message, 'refresh': True})
+        else:
+            user.pending_time_adjustment = seconds
+            user.pending_time_operation = operation
+            db.session.commit()
+            return jsonify({
+                'success': True,
+                'message': (f"Computer offline. Adjustment of {operation}{seconds // 60}m "
+                            "queued and will apply when it reconnects."),
+                'pending': True,
+                'refresh': True,
+            })
+
+    # Multi-host: upsert GroupTimeAdjustment
+    signed = seconds if operation == '+' else -seconds
+    adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
+    if adj:
+        adj.extra_seconds += signed
+    else:
+        adj = GroupTimeAdjustment(username=username, date=today, extra_seconds=signed)
+        db.session.add(adj)
+    db.session.commit()
+
+    total_min = adj.extra_seconds // 60
+    sign_str = '+' if total_min >= 0 else ''
+    return jsonify({
+        'success': True,
+        'message': (f"Pool adjusted {operation}{seconds // 60}m "
+                    f"(total today: {sign_str}{total_min}m). "
+                    "All hosts will be updated within 10 seconds."),
+        'refresh': True,
+    })
+
+
 # With app context
 with app.app_context():
     db.create_all()
@@ -708,4 +964,5 @@ with app.app_context():
     print("Background tasks started automatically")
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host='0.0.0.0', port=5000, debug=debug, use_reloader=debug)
