@@ -203,6 +203,16 @@ class ManagedUser(db.Model):
             result.append({'label': label, 'month': key, 'total': buckets[key]})
         return result
 
+    def get_config_value(self, key):
+        """Extract a specific value from the stored config"""
+        if not self.last_config:
+            return None
+        try:
+            config = json.loads(self.last_config)
+            return config.get(key)
+        except:
+            return None
+
 
 class GroupTimeAdjustment(db.Model):
     """Per-day manual pool adjustment for a username group (signed seconds).
@@ -260,15 +270,6 @@ def group_today_limit(username):
     extra = adj.extra_seconds if adj else 0
     return max(0, base_seconds + extra)
 
-    def get_config_value(self, key):
-        """Extract a specific value from the stored config"""
-        if not self.last_config:
-            return None
-        try:
-            config = json.loads(self.last_config)
-            return config.get(key)
-        except:
-            return None
 
 class UserTimeUsage(db.Model):
     __tablename__ = 'user_time_usage'
