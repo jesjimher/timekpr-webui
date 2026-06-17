@@ -1,7 +1,6 @@
 import threading
 import time
-import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import logging
 import json
 import traceback
@@ -10,8 +9,6 @@ from src.database import (
     db,
     ManagedUser,
     UserTimeUsage,
-    Settings,
-    UserWeeklySchedule,
     UserDailyTimeInterval,
     coerce_time_spent_day,
     GroupTimeAdjustment,
@@ -22,32 +19,49 @@ from src.ssh_helper import SSHClient
 
 logger = logging.getLogger(__name__)
 
+
 class BackgroundTaskManager:
+    # Minimum drift before issuing a settimeleft correction during reconciliation
+    _RECONCILE_THRESHOLD = 60   # seconds
+
+    # How often to re-read usage data from each host (SSH --userinfo)
+    _READ_INTERVAL = 60         # seconds
+
+    # Offline backoff: delay = min(failures * base, max)
+    _BACKOFF_BASE = 30          # seconds per failure
+    _BACKOFF_MAX = 300          # 5 minutes maximum
+
+    # Reconciliation cadence for multi-host groups
+    _RECONCILE_ACTIVE = 30      # seconds when usage is active today
+    _RECONCILE_IDLE = 60        # seconds when no usage today
+
     def __init__(self, app=None):
         self.app = app
         self.running = False
         self.thread = None
         self.last_error = None
-        self._task_lock = threading.Lock()  # Add a lock to prevent concurrent executions
-    
+        self._task_lock = threading.Lock()
+        self._sync_event = threading.Event()   # wakes the loop early on UI save
+        self._host_backoff: dict = {}           # {hostname: {failures, next_retry}}
+        self._last_full_read: dict = {}         # {user_id: datetime}
+        self._last_reconcile: dict = {}         # {username: datetime}
+
     def init_app(self, app):
         self.app = app
-    
+
     def start(self):
-        """Start the background task manager"""
         if self.running:
             logger.info("Task manager already running, not starting again")
             return
-            
         self.running = True
         self.thread = threading.Thread(target=self._run_tasks, daemon=True)
         self.thread.start()
         logger.info("Background task manager started with thread ID: %s", self.thread.ident)
-    
+
     def stop(self):
-        """Stop the background task manager"""
         logger.info("Stopping background task manager...")
         self.running = False
+        self._sync_event.set()  # wake sleeping thread so it exits quickly
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=5)
             if self.thread.is_alive():
@@ -55,45 +69,68 @@ class BackgroundTaskManager:
             else:
                 logger.info("Thread stopped successfully")
         logger.info("Background task manager stopped")
-    
+
     def restart(self):
-        """Restart the background task manager"""
         logger.info("Restarting background task manager...")
         self.stop()
-        time.sleep(1)  # Give it a moment to fully stop
+        time.sleep(1)
         self.start()
         logger.info("Background task manager restarted")
-        
+
+    def trigger_sync(self):
+        """Wake the background loop immediately to push pending changes."""
+        self._sync_event.set()
+
     def get_status(self):
-        """Get the status of the background task manager"""
         status = {
             'running': self.running,
             'thread_alive': self.thread.is_alive() if self.thread else False,
             'last_error': self.last_error,
-            'thread_id': self.thread.ident if self.thread else None
+            'thread_id': self.thread.ident if self.thread else None,
         }
         logger.info("Task manager status: %s", status)
         return status
-    
+
+    # ------------------------------------------------------------------ backoff
+
+    def _host_ready(self, hostname: str) -> bool:
+        state = self._host_backoff.get(hostname)
+        if not state:
+            return True
+        return datetime.utcnow() >= state['next_retry']
+
+    def _record_success(self, hostname: str):
+        if hostname in self._host_backoff:
+            logger.info("Host %s recovered, clearing backoff", hostname)
+            del self._host_backoff[hostname]
+
+    def _record_failure(self, hostname: str):
+        state = self._host_backoff.get(hostname, {'failures': 0})
+        failures = state['failures'] + 1
+        delay = min(failures * self._BACKOFF_BASE, self._BACKOFF_MAX)
+        self._host_backoff[hostname] = {
+            'failures': failures,
+            'next_retry': datetime.utcnow() + timedelta(seconds=delay),
+        }
+        logger.info("Host %s in backoff for %ds (failure #%d)", hostname, delay, failures)
+
+    # ------------------------------------------------------------------ main loop
+
     def _run_tasks(self):
-        """Main task loop"""
         logger.info("Task loop started in thread ID: %s", threading.current_thread().ident)
         while self.running:
             try:
-                # Only process tasks if we can acquire the lock
                 if self._task_lock.acquire(blocking=False):
                     try:
                         logger.info("Starting task execution cycle")
-                        # Use a fresh app context
                         if self.app:
                             with self.app.app_context():
-                                logger.info("Updating user data")
-                                self._update_user_data()
-                                logger.info("User data update cycle complete")
+                                self._push_pending_changes()
+                                self._read_usage_data()
+                                self._reconcile_groups()
                         else:
                             logger.error("App is not initialized in task manager")
-                        
-                        self.last_error = None  # Clear error on successful run
+                        self.last_error = None
                     finally:
                         self._task_lock.release()
                 else:
@@ -107,226 +144,197 @@ class BackgroundTaskManager:
                 self.last_error = {
                     'message': error_msg,
                     'trace': trace,
-                    'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 }
-            
-            # Sleep for 10 seconds before next run
-            logger.info("Task cycle finished, sleeping for 10 seconds")
-            for i in range(10):
-                if not self.running:
-                    logger.info("Task loop stopping during sleep")
-                    break
-                time.sleep(1)
-    
-    def _update_user_data(self):
-        """Update data for all valid users"""
-        try:
-            # Get all users with SQLAlchemy in a single query
-            users = ManagedUser.query.all()
-            logger.info("Found %d users in database", len(users))
 
+            # Sleep up to 10s, but wake immediately on trigger_sync() or stop()
+            logger.info("Task cycle finished, waiting up to 10s")
+            self._sync_event.wait(timeout=10)
+            self._sync_event.clear()
+
+    # ------------------------------------------------------------------ push (fast path)
+
+    def _push_pending_changes(self):
+        """Push unsynced config to remote hosts. Opens SSH only when there's actual work."""
+        try:
+            users = ManagedUser.query.all()
             for user in users:
                 try:
-                    logger.info("Processing user: %s @ %s", user.username, user.system_ip)
-                    
-                    # Connect to the system and get user info - use SSH key authentication
-                    ssh_client = SSHClient(hostname=user.system_ip)
-                    
-                    # Check if there's a pending time adjustment
-                    if user.pending_time_adjustment is not None and user.pending_time_operation is not None:
-                        logger.info(f"Attempting to apply pending time adjustment for {user.username}: {user.pending_time_operation}{user.pending_time_adjustment} seconds")
-                        
-                        success, message = ssh_client.modify_time_left(
-                            user.username, 
-                            user.pending_time_operation, 
-                            user.pending_time_adjustment
-                        )
-                        
-                        if success:
-                            logger.info(f"Successfully applied pending time adjustment for {user.username}")
-                            # Clear the pending adjustment immediately
-                            user.pending_time_adjustment = None
-                            user.pending_time_operation = None
-                            db.session.commit()
-                            logger.info("Cleared pending adjustment in database")
-                        else:
-                            logger.warning(f"Failed to apply pending time adjustment for {user.username}: {message}")
-                    else:
-                        logger.info(f"No pending time adjustment for {user.username}")
-                    
-                    # Check if there's a pending weekly schedule sync
-                    if user.weekly_schedule and not user.weekly_schedule.is_synced:
-                        schedule_dict = user.weekly_schedule.get_schedule_dict()
-                        logger.info(f"DEBUG - schedule_dict from database: {schedule_dict}")
-                        _week_days = (
-                            'monday', 'tuesday', 'wednesday', 'thursday',
-                            'friday', 'saturday', 'sunday',
-                        )
-                        has_positive_limits = any(
-                            (schedule_dict.get(d, 0) or 0) > 0 for d in _week_days
-                        )
-                        # set_weekly_time_limits rejects "all zero" — nothing to push; avoid endless WARNING loop
-                        if not has_positive_limits:
-                            logger.info(
-                                "No daily limits > 0 in UI for %s; marking weekly schedule synced (remote unchanged)",
-                                user.username,
-                            )
-                            user.weekly_schedule.mark_synced()
-                            db.session.commit()
-                        else:
-                            logger.info(f"Attempting to sync weekly schedule for {user.username}")
-                            success, message = ssh_client.set_weekly_time_limits(
-                                user.username, schedule_dict
-                            )
-                            if success:
-                                logger.info(f"Successfully synced weekly schedule for {user.username}")
-                                user.weekly_schedule.mark_synced()
-                                db.session.commit()
-                                logger.info("Marked weekly schedule as synced in database")
-                            else:
-                                logger.warning(
-                                    f"Failed to sync weekly schedule for {user.username}: {message}"
-                                )
-                    else:
-                        if user.weekly_schedule:
-                            logger.info(f"Weekly schedule already synced for {user.username}")
-                        else:
-                            logger.info(f"No weekly schedule configured for {user.username}")
-                    
-                    # Check if there are pending time interval syncs
-                    unsynced_intervals = UserDailyTimeInterval.query.filter_by(
-                        user_id=user.id,
-                        is_synced=False
-                    ).all()
-                    
-                    if unsynced_intervals:
-                        logger.info(f"Attempting to sync {len(unsynced_intervals)} time intervals for {user.username}")
-                        
-                        # Build intervals dict for SSH command
-                        intervals_dict = {}
-                        for interval in user.time_intervals:
-                            intervals_dict[interval.day_of_week] = interval
-                        
-                        success, message = ssh_client.set_allowed_hours(user.username, intervals_dict)
-                        
-                        if success:
-                            logger.info(f"Successfully synced time intervals for {user.username}")
-                            # Mark all intervals as synced
-                            for interval in unsynced_intervals:
-                                interval.mark_synced()
-                            db.session.commit()
-                            logger.info("Marked time intervals as synced in database")
-                        else:
-                            logger.warning(f"Failed to sync time intervals for {user.username}: {message}")
-                    else:
-                        logger.info(f"No pending time interval syncs for {user.username}")
-                    
-                    # Then update user info
-                    logger.info("Validating user %s", user.username)
-                    try:
-                        is_valid, result_message, config_dict = ssh_client.validate_user(user.username)
-                        logger.info("Validation result for %s: %s", user.username, is_valid)
-                        
-                        if is_valid and config_dict:
-                            # Update the last checked time
-                            user.last_checked = datetime.utcnow()
-                            user.last_config = json.dumps(config_dict)
-                            user.is_valid = True  # Ensure is_valid is set to True
-                            
-                            # Update or create today's usage data
-                            today = date.today()
-                            time_spent = coerce_time_spent_day(config_dict.get('TIME_SPENT_DAY', 0))
-                            
-                            # Look for an existing record for today
-                            usage = UserTimeUsage.query.filter_by(
-                                user_id=user.id,
-                                date=today
-                            ).first()
-                            
-                            if usage:
-                                usage.time_spent = time_spent
-                                logger.info(f"Updated existing usage record for {user.username}, time_spent={time_spent}")
-                            else:
-                                # Create a new record
-                                usage = UserTimeUsage(
-                                    user_id=user.id,
-                                    date=today,
-                                    time_spent=time_spent
-                                )
-                                db.session.add(usage)
-                                logger.info(f"Created new usage record for {user.username}, time_spent={time_spent}")
-                            
-                            # Make sure to commit after each user update
-                            db.session.commit()
-                            logger.info(f"Database committed for {user.username}")
-                        else:
-                            # Just update the last checked time
-                            user.last_checked = datetime.utcnow()
-                            
-                            # Don't change is_valid status for temporary failures
-                            # This allows the user to stay visible on the dashboard
-                            # Only set is_valid to False during the initial validation
-                            if not user.is_valid and is_valid:
-                                # If the user was previously invalid but is now valid, update status
-                                user.is_valid = True
-                            
-                            db.session.commit()
-                            logger.warning(f"Failed to get data for {user.username}, keeping previous valid status")
-                    except Exception as e:
-                        # Connection error (e.g., PC is offline)
-                        logger.error(f"Connection error for user {user.username}: {str(e)}")
-                        
-                        # Update the last checked time but don't change validation status
-                        user.last_checked = datetime.utcnow()
-                        db.session.commit()
-                        logger.info(f"Updated last_checked time for {user.username} but kept validation status")
-                
-                except Exception as e:
-                    logger.error(f"Error updating user {user.username}: {str(e)}\n{traceback.format_exc()}")
-                    # Continue with the next user, but make sure we commit any pending changes
-                    db.session.rollback()
-                    
-            # After processing all individual users, run cross-host reconciliation
-            self._reconcile_groups()
+                    has_pending = (
+                        (user.pending_time_adjustment is not None and user.pending_time_operation is not None)
+                        or (user.weekly_schedule and not user.weekly_schedule.is_synced)
+                        or UserDailyTimeInterval.query.filter_by(
+                            user_id=user.id, is_synced=False
+                        ).first() is not None
+                    )
+                    if not has_pending:
+                        continue
 
+                    if not self._host_ready(user.system_ip):
+                        logger.info("Host %s in backoff, skipping push for %s",
+                                    user.system_ip, user.username)
+                        continue
+
+                    logger.info("Pushing pending changes for %s @ %s", user.username, user.system_ip)
+                    try:
+                        with SSHClient(hostname=user.system_ip) as ssh:
+                            self._apply_user_changes(user, ssh)
+                        self._record_success(user.system_ip)
+                    except Exception as e:
+                        logger.error("SSH error pushing to %s @ %s: %s",
+                                     user.username, user.system_ip, e)
+                        self._record_failure(user.system_ip)
+                        db.session.rollback()
+                except Exception as e:
+                    logger.error("Error processing pending for %s: %s\n%s",
+                                 user.username, e, traceback.format_exc())
+                    db.session.rollback()
         except Exception as e:
-            logger.error(f"Error in user data update: {str(e)}\n{traceback.format_exc()}")
+            logger.error("Error in _push_pending_changes: %s\n%s", e, traceback.format_exc())
             db.session.rollback()
 
-    # Minimum seconds drift between desired and actual time-left before we
-    # issue a settimeleft correction.  Keeps SSH traffic low while still
-    # converging quickly (one 10s cycle suffices for any reasonable activity).
-    _RECONCILE_THRESHOLD = 60  # seconds
+    def _apply_user_changes(self, user, ssh: SSHClient):
+        """Apply all pending changes for one user over an already-open SSH connection."""
+        # --- time adjustment ---
+        if user.pending_time_adjustment is not None and user.pending_time_operation is not None:
+            logger.info("Applying pending time adjustment for %s: %s%ds",
+                        user.username, user.pending_time_operation, user.pending_time_adjustment)
+            success, message = ssh.modify_time_left(
+                user.username, user.pending_time_operation, user.pending_time_adjustment
+            )
+            if success:
+                user.pending_time_adjustment = None
+                user.pending_time_operation = None
+                db.session.commit()
+                logger.info("Cleared pending time adjustment for %s", user.username)
+            else:
+                logger.warning("Failed to apply time adjustment for %s: %s", user.username, message)
+
+        # --- weekly schedule ---
+        if user.weekly_schedule and not user.weekly_schedule.is_synced:
+            schedule_dict = user.weekly_schedule.get_schedule_dict()
+            _week_days = ('monday', 'tuesday', 'wednesday', 'thursday',
+                          'friday', 'saturday', 'sunday')
+            if not any((schedule_dict.get(d, 0) or 0) > 0 for d in _week_days):
+                user.weekly_schedule.mark_synced()
+                db.session.commit()
+            else:
+                success, message = ssh.set_weekly_time_limits(user.username, schedule_dict)
+                if success:
+                    user.weekly_schedule.mark_synced()
+                    db.session.commit()
+                    logger.info("Synced weekly schedule for %s", user.username)
+                else:
+                    logger.warning("Failed to sync weekly schedule for %s: %s", user.username, message)
+
+        # --- time intervals ---
+        unsynced_intervals = UserDailyTimeInterval.query.filter_by(
+            user_id=user.id, is_synced=False
+        ).all()
+        if unsynced_intervals:
+            intervals_dict = {iv.day_of_week: iv for iv in user.time_intervals}
+            success, message = ssh.set_allowed_hours(user.username, intervals_dict)
+            if success:
+                for iv in unsynced_intervals:
+                    iv.mark_synced()
+                db.session.commit()
+                logger.info("Synced %d time intervals for %s", len(unsynced_intervals), user.username)
+            else:
+                logger.warning("Failed to sync time intervals for %s: %s", user.username, message)
+
+    # ------------------------------------------------------------------ read usage (slow path)
+
+    def _read_usage_data(self):
+        """Read current usage from all hosts. Each host polled at most every _READ_INTERVAL seconds."""
+        now = datetime.utcnow()
+        try:
+            users = ManagedUser.query.all()
+            for user in users:
+                try:
+                    last_read = self._last_full_read.get(user.id)
+                    if last_read and (now - last_read).total_seconds() < self._READ_INTERVAL:
+                        continue  # not due yet
+
+                    if not self._host_ready(user.system_ip):
+                        logger.info("Host %s in backoff, skipping read for %s",
+                                    user.system_ip, user.username)
+                        continue
+
+                    logger.info("Reading usage for %s @ %s", user.username, user.system_ip)
+                    try:
+                        with SSHClient(hostname=user.system_ip) as ssh:
+                            is_valid, result_message, config_dict = ssh.validate_user(user.username)
+                        self._record_success(user.system_ip)
+                        self._last_full_read[user.id] = now
+
+                        user.last_checked = now
+                        if is_valid and config_dict:
+                            user.last_config = json.dumps(config_dict)
+                            user.is_valid = True
+                            today = date.today()
+                            time_spent = coerce_time_spent_day(config_dict.get('TIME_SPENT_DAY', 0))
+                            usage = UserTimeUsage.query.filter_by(
+                                user_id=user.id, date=today
+                            ).first()
+                            if usage:
+                                usage.time_spent = time_spent
+                            else:
+                                db.session.add(
+                                    UserTimeUsage(user_id=user.id, date=today, time_spent=time_spent)
+                                )
+                            logger.info("Updated usage for %s: %ds", user.username, time_spent)
+                        else:
+                            logger.warning("Could not get data for %s: %s", user.username, result_message)
+                        db.session.commit()
+                    except Exception as e:
+                        logger.error("SSH error reading %s @ %s: %s",
+                                     user.username, user.system_ip, e)
+                        self._record_failure(user.system_ip)
+                        user.last_checked = now
+                        try:
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
+                except Exception as e:
+                    logger.error("Error reading usage for %s: %s\n%s",
+                                 user.username, e, traceback.format_exc())
+                    db.session.rollback()
+        except Exception as e:
+            logger.error("Error in _read_usage_data: %s\n%s", e, traceback.format_exc())
+            db.session.rollback()
+
+    # ------------------------------------------------------------------ group reconciliation
 
     def _reconcile_groups(self):
-        """Enforce the shared time pool across every multi-host username group.
+        """Enforce shared time pool across multi-host groups with adaptive cadence.
 
-        For each group of ≥2 valid hosts that share a username:
-        1. Compute desired = group_today_limit - total_spent_today.
-        2. For every reachable host, if its TIME_LEFT_DAY deviates from
-           desired by more than _RECONCILE_THRESHOLD seconds, push a
-           relative adjustment via timekpra --settimeleft.
-
-        Single-host groups are untouched — they keep the existing per-host
-        pending_time_adjustment behaviour.
+        Polls active groups (usage > 0 today) every _RECONCILE_ACTIVE seconds,
+        idle groups every _RECONCILE_IDLE seconds.
         """
-        groups = get_user_groups()  # {username: [ManagedUser, ...]}
+        groups = get_user_groups()
         today = date.today()
+        now = datetime.utcnow()
 
         for username, members in groups.items():
             if len(members) < 2:
-                continue  # single-host: handled by existing per-host logic
+                continue  # single-host: handled by per-host pending_time_adjustment
 
             try:
-                limit = group_today_limit(username)
-                if limit <= 0:
-                    logger.info("Group '%s': no daily limit set, skipping reconciliation", username)
+                total_spent = sum(
+                    (UserTimeUsage.query.filter_by(user_id=m.id, date=today).first() or
+                     type('_', (), {'time_spent': 0})()).time_spent
+                    for m in members
+                )
+
+                interval = self._RECONCILE_ACTIVE if total_spent > 0 else self._RECONCILE_IDLE
+                last = self._last_reconcile.get(username)
+                if last and (now - last).total_seconds() < interval:
                     continue
 
-                total_spent = 0
-                for m in members:
-                    usage = UserTimeUsage.query.filter_by(user_id=m.id, date=today).first()
-                    total_spent += (usage.time_spent if usage else 0)
+                limit = group_today_limit(username)
+                if limit <= 0:
+                    self._last_reconcile[username] = now
+                    continue
 
                 desired = max(0, limit - total_spent)
                 logger.info(
@@ -339,50 +347,46 @@ class BackgroundTaskManager:
                     try:
                         current_left = m.get_config_value('TIME_LEFT_DAY')
                         if current_left is None:
-                            logger.info(
-                                "No TIME_LEFT_DAY cached for %s@%s, skipping this host",
-                                username, m.system_ip,
-                            )
                             continue
 
                         any_host_reached = True
                         delta = desired - current_left
                         if abs(delta) < self._RECONCILE_THRESHOLD:
-                            logger.info(
-                                "%s@%s: delta=%ds < threshold, no adjustment needed",
-                                username, m.system_ip, delta,
-                            )
+                            logger.info("%s@%s: delta=%ds < threshold, no adjustment",
+                                        username, m.system_ip, delta)
+                            continue
+
+                        if not self._host_ready(m.system_ip):
+                            logger.info("Host %s in backoff, skipping reconciliation", m.system_ip)
                             continue
 
                         operation = '+' if delta > 0 else '-'
                         amount = abs(delta)
-                        logger.info(
-                            "Reconciling %s@%s: %s%ds (current=%d desired=%d)",
-                            username, m.system_ip, operation, amount, current_left, desired,
-                        )
-                        ssh_client = SSHClient(hostname=m.system_ip)
-                        success, msg = ssh_client.modify_time_left(username, operation, amount)
-                        if success:
-                            logger.info("Reconciliation OK for %s@%s", username, m.system_ip)
-                        else:
-                            logger.warning(
-                                "Reconciliation failed for %s@%s: %s",
-                                username, m.system_ip, msg,
-                            )
+                        logger.info("Reconciling %s@%s: %s%ds (current=%d desired=%d)",
+                                    username, m.system_ip, operation, amount, current_left, desired)
+                        try:
+                            with SSHClient(hostname=m.system_ip) as ssh:
+                                success, msg = ssh.modify_time_left(username, operation, amount)
+                            if success:
+                                self._record_success(m.system_ip)
+                                logger.info("Reconciliation OK for %s@%s", username, m.system_ip)
+                            else:
+                                logger.warning("Reconciliation failed for %s@%s: %s",
+                                               username, m.system_ip, msg)
+                        except Exception as e:
+                            logger.error("SSH error reconciling %s@%s: %s", username, m.system_ip, e)
+                            self._record_failure(m.system_ip)
                     except Exception as e:
-                        logger.error(
-                            "Error reconciling %s@%s: %s",
-                            username, m.system_ip, e,
-                        )
+                        logger.error("Error reconciling %s@%s: %s", username, m.system_ip, e)
+
+                self._last_reconcile[username] = now
 
                 if any_host_reached:
                     adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
                     if adj and adj.reconciled_at is None:
-                        adj.reconciled_at = datetime.utcnow()
+                        adj.reconciled_at = now
                         db.session.commit()
 
             except Exception as e:
-                logger.error(
-                    "Error reconciling group '%s': %s\n%s",
-                    username, e, traceback.format_exc(),
-                )
+                logger.error("Error reconciling group '%s': %s\n%s",
+                             username, e, traceback.format_exc())

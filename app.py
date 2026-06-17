@@ -557,6 +557,7 @@ def update_weekly_schedule():
                     m.weekly_schedule = sched
                 m.weekly_schedule.set_schedule_from_dict(schedule_data)
             db.session.commit()
+            task_manager.trigger_sync()
             flash(f'Weekly schedule updated for all hosts of {group_username}', 'success')
         except Exception as e:
             db.session.rollback()
@@ -586,6 +587,7 @@ def update_weekly_schedule():
     schedule.set_schedule_from_dict(schedule_data)
     try:
         db.session.commit()
+        task_manager.trigger_sync()
         flash(f'Weekly schedule updated for {user.username}', 'success')
     except Exception as e:
         db.session.rollback()
@@ -686,7 +688,8 @@ def update_user_intervals(user_id):
                 }), 400
         
         db.session.commit()
-        
+        task_manager.trigger_sync()
+
         return jsonify({
             'success': True,
             'message': f'Time intervals updated for {user.username}',
@@ -903,11 +906,11 @@ def modify_time():
         })
     else:
         # Store as pending adjustment if it failed
-        # First clear any existing pending adjustment
         user.pending_time_adjustment = seconds
         user.pending_time_operation = operation
         db.session.commit()
-        
+        task_manager.trigger_sync()
+
         return jsonify({
             'success': True,  # We report success since we stored it for later
             'message': f"Computer seems to be offline. Time adjustment of {operation}{seconds} seconds has been queued and will be applied when the computer comes online.",
@@ -965,6 +968,7 @@ def group_adjust_pool(username):
             user.pending_time_adjustment = seconds
             user.pending_time_operation = operation
             db.session.commit()
+            task_manager.trigger_sync()
             return jsonify({
                 'success': True,
                 'message': (f"Computer offline. Adjustment of {operation}{seconds // 60}m "
