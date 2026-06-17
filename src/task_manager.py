@@ -334,6 +334,7 @@ class BackgroundTaskManager:
                     username, limit, total_spent, desired,
                 )
 
+                any_host_reached = False
                 for m in members:
                     try:
                         current_left = m.get_config_value('TIME_LEFT_DAY')
@@ -344,6 +345,7 @@ class BackgroundTaskManager:
                             )
                             continue
 
+                        any_host_reached = True
                         delta = desired - current_left
                         if abs(delta) < self._RECONCILE_THRESHOLD:
                             logger.info(
@@ -372,6 +374,12 @@ class BackgroundTaskManager:
                             "Error reconciling %s@%s: %s",
                             username, m.system_ip, e,
                         )
+
+                if any_host_reached:
+                    adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
+                    if adj and adj.reconciled_at is None:
+                        adj.reconciled_at = datetime.utcnow()
+                        db.session.commit()
 
             except Exception as e:
                 logger.error(

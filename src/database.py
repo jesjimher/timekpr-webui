@@ -226,6 +226,7 @@ class GroupTimeAdjustment(db.Model):
     username = db.Column(db.String(50), nullable=False)
     date = db.Column(db.Date, nullable=False)
     extra_seconds = db.Column(db.Integer, default=0)  # positive = bonus, negative = penalty
+    reconciled_at = db.Column(db.DateTime, nullable=True)  # set after first successful reconciliation
 
     __table_args__ = (
         db.UniqueConstraint('username', 'date', name='group_user_date_uc'),

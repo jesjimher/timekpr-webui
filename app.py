@@ -172,7 +172,7 @@ def dashboard():
 
         # --- Pending pool adjustment flag ---
         pool_adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
-        has_pending = bool(pool_adj and pool_adj.extra_seconds != 0)
+        has_pending = bool(pool_adj and pool_adj.extra_seconds != 0 and pool_adj.reconciled_at is None)
         if not has_pending and len(members) == 1:
             has_pending = bool(
                 members[0].pending_time_adjustment is not None and
@@ -978,6 +978,7 @@ def group_adjust_pool(username):
     adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
     if adj:
         adj.extra_seconds += signed
+        adj.reconciled_at = None  # reset so badge reappears until next reconciliation cycle
     else:
         adj = GroupTimeAdjustment(username=username, date=today, extra_seconds=signed)
         db.session.add(adj)
@@ -998,6 +999,14 @@ def group_adjust_pool(username):
 with app.app_context():
     db.create_all()
     print("Database tables verified")
+
+    # Add reconciled_at column if it doesn't exist (migration for existing DBs)
+    with db.engine.connect() as conn:
+        cols = [row[1] for row in conn.execute(db.text("PRAGMA table_info(group_time_adjustment)"))]
+        if 'reconciled_at' not in cols:
+            conn.execute(db.text("ALTER TABLE group_time_adjustment ADD COLUMN reconciled_at DATETIME"))
+            conn.commit()
+            print("Migrated group_time_adjustment: added reconciled_at column")
 
     # Initialize admin password if it doesn't exist
     if not Settings.get_value('admin_password_hash', None) and not Settings.get_value('admin_password', None):
