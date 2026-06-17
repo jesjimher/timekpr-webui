@@ -18,6 +18,7 @@ from src.database import (
 )
 from src.ssh_helper import SSHClient
 from src.task_manager import BackgroundTaskManager
+from src.auth import get_authenticated_user, get_auth_mode, set_auth_mode
 
 # Configure logging
 logging.basicConfig(
@@ -73,12 +74,24 @@ def inject_timezone():
 
 @app.route('/', methods=['GET', 'POST'])
 def login():
+    auth_mode = get_auth_mode()
+
+    # If using external mode, check if already authenticated
+    if auth_mode == 'external':
+        if get_authenticated_user():
+            return redirect(url_for('dashboard'))
+
     error = None
-    
+
     if request.method == 'POST':
+        # Only process login form in 'local' mode
+        if auth_mode != 'local':
+            flash('Login form is disabled in this mode', 'danger')
+            return render_template('login.html', error='Login form is disabled', auth_mode=auth_mode)
+
         username = request.form.get('username')
         password = request.form.get('password')
-        
+
         # Check admin password using hash comparison
         if username == ADMIN_USERNAME and Settings.check_admin_password(password):
             session['logged_in'] = True
@@ -87,12 +100,13 @@ def login():
         else:
             error = 'Invalid credentials. Please try again.'
             flash(error, 'danger')
-    
-    return render_template('login.html', error=error)
+
+    return render_template('login.html', error=error, auth_mode=auth_mode)
 
 @app.route('/dashboard')
 def dashboard():
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
 
@@ -194,7 +208,8 @@ def dashboard():
 
 @app.route('/admin')
 def admin():
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
     
@@ -204,39 +219,54 @@ def admin():
 
 @app.route('/settings', methods=['GET', 'POST'])
 def settings():
-    if not session.get('logged_in'):
+    if not get_authenticated_user():
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
-    
-    # Handle password change
+
+    # Handle auth mode change
     if request.method == 'POST':
-        current_password = request.form.get('current_password')
-        new_password = request.form.get('new_password')
-        confirm_password = request.form.get('confirm_password')
-        
-        # Validate inputs
-        if not current_password or not new_password or not confirm_password:
-            flash('All fields are required', 'danger')
-        elif not Settings.check_admin_password(current_password):
-            flash('Current password is incorrect', 'danger')
-        elif new_password != confirm_password:
-            flash('New passwords do not match', 'danger')
-        elif len(new_password) < 4:
-            flash('New password must be at least 4 characters long', 'danger')
-        else:
-            # Update the password with hashing
-            Settings.set_admin_password(new_password)
-            flash('Password updated successfully', 'success')
-            
-            # Redirect to avoid form resubmission
-            return redirect(url_for('settings'))
-    
-    return render_template('settings.html')
+        action = request.form.get('action')
+
+        if action == 'change_password':
+            current_password = request.form.get('current_password')
+            new_password = request.form.get('new_password')
+            confirm_password = request.form.get('confirm_password')
+
+            # Validate inputs
+            if not current_password or not new_password or not confirm_password:
+                flash('All fields are required', 'danger')
+            elif not Settings.check_admin_password(current_password):
+                flash('Current password is incorrect', 'danger')
+            elif new_password != confirm_password:
+                flash('New passwords do not match', 'danger')
+            elif len(new_password) < 4:
+                flash('New password must be at least 4 characters long', 'danger')
+            else:
+                # Update the password with hashing
+                Settings.set_admin_password(new_password)
+                flash('Password updated successfully', 'success')
+                return redirect(url_for('settings'))
+
+        elif action == 'change_auth_mode':
+            auth_mode = request.form.get('auth_mode')
+            try:
+                set_auth_mode(auth_mode)
+                flash(f'Authentication mode changed to: {auth_mode}', 'success')
+                return redirect(url_for('settings'))
+            except ValueError as e:
+                flash(f'Error: {str(e)}', 'danger')
+
+    # Get current auth settings
+    current_auth_mode = get_auth_mode()
+
+    return render_template('settings.html',
+                         current_auth_mode=current_auth_mode)
 
 @app.route('/api/task-status')
 def get_task_status():
     """Get the status of the background task manager"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     status = task_manager.get_status()
@@ -248,7 +278,8 @@ def get_task_status():
 @app.route('/restart-tasks')
 def restart_tasks():
     """Restart the background task manager"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
     
@@ -351,7 +382,8 @@ def add_user():
 
 @app.route('/users/validate/<int:user_id>')
 def validate_user(user_id):
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -397,7 +429,8 @@ def validate_user(user_id):
 
 @app.route('/users/delete/<int:user_id>', methods=['POST'])
 def delete_user(user_id):
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -412,7 +445,8 @@ def delete_user(user_id):
 @app.route('/api/user/<int:user_id>/usage')
 def get_user_usage(user_id):
     """API endpoint to get user usage data"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -437,7 +471,8 @@ def get_user_usage(user_id):
 @app.route('/weekly-schedule/<int:user_id>')
 def weekly_schedule_user(user_id):
     """Display weekly schedule management page for a single host (legacy / admin use)."""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
 
@@ -460,7 +495,8 @@ def weekly_schedule_user(user_id):
 @app.route('/weekly-schedule/group/<username>')
 def weekly_schedule_group(username):
     """Display weekly schedule management page for a username group."""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
 
@@ -490,7 +526,8 @@ def weekly_schedule_group(username):
 @app.route('/weekly-schedule/update', methods=['POST'])
 def update_weekly_schedule():
     """Update weekly schedule — fans out to all group members when group_username is set."""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
 
     days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
@@ -558,7 +595,8 @@ def update_weekly_schedule():
 @app.route('/api/user/<int:user_id>/intervals')
 def get_user_intervals(user_id):
     """API endpoint to get user time intervals"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -591,7 +629,8 @@ def get_user_intervals(user_id):
 @app.route('/api/user/<int:user_id>/intervals/update', methods=['POST'])
 def update_user_intervals(user_id):
     """API endpoint to update user time intervals"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -664,7 +703,8 @@ def update_user_intervals(user_id):
 @app.route('/api/user/<int:user_id>/intervals/sync-status')
 def get_intervals_sync_status(user_id):
     """Get sync status of user's time intervals"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -699,7 +739,8 @@ def get_intervals_sync_status(user_id):
 @app.route('/api/schedule-sync-status/<int:user_id>')
 def get_schedule_sync_status(user_id):
     """Get the sync status of a user's weekly schedule"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
@@ -729,7 +770,8 @@ def get_schedule_sync_status(user_id):
 @app.route('/stats/<int:user_id>')
 def user_stats(user_id):
     """Display extended usage history for a single host."""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
 
@@ -746,7 +788,8 @@ def user_stats(user_id):
 @app.route('/stats/group/<username>')
 def group_stats(username):
     """Display aggregated usage history across all hosts of a username group."""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         flash('Please login first', 'warning')
         return redirect(url_for('login'))
 
@@ -810,7 +853,8 @@ def group_stats(username):
 @app.route('/api/modify-time', methods=['POST'])
 def modify_time():
     """Modify time left for a user"""
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     # Get parameters from request
@@ -881,7 +925,8 @@ def group_adjust_pool(username):
     GroupTimeAdjustment record is created/updated; the reconciliation loop
     will propagate the change to all hosts within the next 10 s cycle.
     """
-    if not session.get('logged_in'):
+    user = get_authenticated_user()
+    if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
 
     operation = request.form.get('operation')
@@ -953,11 +998,16 @@ def group_adjust_pool(username):
 with app.app_context():
     db.create_all()
     print("Database tables verified")
-    
+
     # Initialize admin password if it doesn't exist
     if not Settings.get_value('admin_password_hash', None) and not Settings.get_value('admin_password', None):
         Settings.set_admin_password('admin')
         print("Admin password initialized")
+
+    # Initialize authentication mode if it doesn't exist (default: local)
+    if not Settings.get_value('AUTH_MODE', None):
+        Settings.set_value('AUTH_MODE', 'local')
+        print("Authentication mode initialized to: local (username/password)")
     
     # Start background tasks automatically
     task_manager.start()

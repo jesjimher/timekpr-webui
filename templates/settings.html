@@ -114,6 +114,54 @@
         {% endwith %}
         
         <div class="users-grid" style="grid-template-columns: 1fr; max-width: 600px; margin: 0 auto;">
+            <!-- Authentication Mode Settings -->
+            <div class="card">
+                <div class="card-header">
+                    <div style="display: flex; align-items: center; gap: var(--space-3);">
+                        <svg width="24" height="24" fill="var(--text-secondary)" viewBox="0 0 16 16">
+                            <path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2zM5 8h6a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/>
+                        </svg>
+                        <div>
+                            <h2>Authentication Mode</h2>
+                            <p style="margin: 0; color: var(--text-tertiary); font-size: var(--font-size-sm);">Configure how users authenticate to TimeKpr WebUI</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <form action="{{ url_for('settings') }}" method="POST">
+                        <input type="hidden" name="action" value="change_auth_mode">
+
+                        <div class="form-group">
+                            <label for="auth_mode" class="form-label">
+                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16" style="margin-right: var(--space-2);">
+                                    <path d="M13.545 2.907a13.227 13.227 0 0 0-3.257-1.011.05.05 0 0 0-.052.025c-.141.25-.297.577-.406.833a12.19 12.19 0 0 0-3.658 0c-.11-.256-.266-.583-.437-.833a.05.05 0 0 0-.052-.025c-1.125.194-2.22.534-3.257 1.011a.05.05 0 0 0-.027.035c-.568 1.07-.892 2.246-.892 3.465 0 .213.005.426.015.637a.05.05 0 0 0 .041.048c.377.35.763.726 1.16 1.074a.05.05 0 0 0 .057-.007c.418-.319.854-.646 1.203-.952a.05.05 0 0 0 .041-.06c-.062-.304-.118-.612-.165-.918a.05.05 0 0 1 .041-.06c.371-.08.741-.16 1.11-.236a.05.05 0 0 1 .059.041c.52 2.007.998 4.005 1.42 6.02.015.087.021.197.021.308v.5A8.5 8.5 0 1 1 8 .5v.5c0 .111.006.221.021.308 1.427-2.022 1.96-4.007 1.42-6.02a.05.05 0 0 1 .059-.041c.37.076.74.156 1.11.236a.05.05 0 0 1 .041.06c-.047.306-.103.614-.165.918a.05.05 0 0 0 .041.06c.35.306.785.633 1.203.952a.05.05 0 0 0 .057.007c.397-.348.783-.724 1.16-1.074a.05.05 0 0 0 .041-.048c.01-.211.015-.424.015-.637 0-1.22-.324-2.395-.892-3.465a.05.05 0 0 0-.027-.035z"/>
+                                </svg>
+                                Authentication Mode
+                            </label>
+                            <select id="auth_mode" name="auth_mode" class="form-control">
+                                <option value="local" {% if current_auth_mode == 'local' %}selected{% endif %}>Local (Username & Password)</option>
+                                <option value="external" {% if current_auth_mode == 'external' %}selected{% endif %}>External (Proxy Auth)</option>
+                            </select>
+                            <small style="color: var(--text-tertiary); display: block; margin-top: var(--space-2);">
+                                <strong>Local:</strong> Standard admin login with username and password.<br>
+                                <strong>External:</strong> Authentication delegated to reverse proxy (Caddy, nginx, Traefik, etc).
+                            </small>
+                        </div>
+
+                        <div class="form-group">
+                            <button type="submit" class="btn btn-primary btn-lg" style="width: 100%;">
+                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M15.854 5.146a.5.5 0 0 1 0 .708l-3 3a.5.5 0 0 1-.708 0l-1.5-1.5a.5.5 0 0 1 .708-.708L12.5 7.793l2.646-2.647a.5.5 0 0 1 .708 0z"/>
+                                    <path d="M1 14s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H1zm5-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/>
+                                </svg>
+                                Save Authentication Settings
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Change Password Card -->
             <div class="card">
                 <div class="card-header">
                     <div style="display: flex; align-items: center; gap: var(--space-3);">
@@ -135,6 +183,7 @@
                     </div>
                     
                     <form action="{{ url_for('settings') }}" method="POST">
+                        <input type="hidden" name="action" value="change_password">
                         <div class="form-group">
                             <label for="current_password" class="form-label">
                                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16" style="margin-right: var(--space-2);">
