@@ -18,6 +18,25 @@ A web-based interface for managing TimeKpr parental controls across multiple com
 
 ---
 
+## 🔄 Changes from Upstream
+
+This fork includes the following enhancements over the original project:
+
+### 1. **External Authentication Mode** (v3b7bb66)
+- Delegates authentication to an external proxy instead of using local password authentication
+- Useful for integrating with enterprise identity providers (LDAP, OAuth, SAML, etc.)
+- Reduces password management overhead and improves security by leveraging existing authentication infrastructure
+- New configuration options available in the **Settings** page
+
+### 2. **Unified User Management Across Multiple Computers** (v5e43195)
+- Ability to group and manage the same user account across different computers as a single entity
+- Improved dashboard interface that displays aggregated usage data for users on multiple systems
+- Better organization of users when managing large deployments with overlapping user accounts
+- Enhanced scheduling that applies to a user's accounts across all their computers simultaneously
+- Simplified user management interface for handling complex multi-computer environments
+
+---
+
 ## 🚀 Getting Started
 
 ### Prerequisites
