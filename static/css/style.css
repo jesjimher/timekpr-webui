@@ -469,13 +469,18 @@ p {
   color: var(--text-secondary);
 }
 
+.host-entry {
+  display: inline-flex;
+  align-items: center;
+}
+
 .host-offline-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: var(--danger);
-  margin-right: var(--space-2);
-  vertical-align: middle;
+  margin-right: var(--space-1);
+  flex-shrink: 0;
   cursor: default;
 }
 
