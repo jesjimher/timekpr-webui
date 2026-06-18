@@ -134,7 +134,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <p class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}">{{ host.ip }}<span class="host-offline-dot" style="display: {{ 'inline-block' if host.offline else 'none' }};" title="This computer is offline"></span></span>{% if not loop.last %}, {% endif %}
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}"><span class="host-offline-dot" style="display: {{ 'inline-block' if host.offline else 'none' }};" title="This computer is offline"></span>{{ host.ip }}</span>{% if not loop.last %}, {% endif %}
                                     {%- endfor -%}
                                 </p>
                             </div>
