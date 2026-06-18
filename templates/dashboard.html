@@ -101,8 +101,9 @@
                         const offlineSet = new Set(data.offline_ips);
                         document.querySelectorAll('.host-entry').forEach(el => {
                             const ip = el.dataset.hostIp;
-                            const badge = el.querySelector('.host-offline-badge');
-                            if (badge) badge.style.display = offlineSet.has(ip) ? 'inline-flex' : 'none';
+                            const badge = el.querySelector('.host-offline-dot');
+                            if (badge) badge.style.display = offlineSet.has(ip) ? 'inline-block' : 'none';
+                            if (badge) badge.title = offlineSet.has(ip) ? 'This computer is offline' : '';
                         });
                     })
                     .catch(() => {});
@@ -133,7 +134,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <p class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}">{{ host.ip }}<span class="badge badge-danger host-offline-badge" style="display: {{ 'inline-flex' if host.offline else 'none' }};">Offline</span></span>{% if not loop.last %}, {% endif %}
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}">{{ host.ip }}<span class="host-offline-dot" style="display: {{ 'inline-block' if host.offline else 'none' }};" title="This computer is offline"></span></span>{% if not loop.last %}, {% endif %}
                                     {%- endfor -%}
                                 </p>
                             </div>

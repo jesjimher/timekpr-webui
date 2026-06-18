@@ -469,9 +469,14 @@ p {
   color: var(--text-secondary);
 }
 
-.host-offline-badge {
+.host-offline-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
   margin-left: var(--space-2);
   vertical-align: middle;
+  cursor: default;
 }
 
 /* Status Indicators */
