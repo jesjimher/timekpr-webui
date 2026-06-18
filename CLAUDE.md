@@ -70,6 +70,10 @@ Commands are tried without `sudo` first, then retried with `sudo` if the first a
 
 All datetimes are stored as UTC in the database. The `TZ` env var controls display timezone (default: `UTC`). A `localtime` Jinja2 filter converts UTC datetimes for templates. The `TZ` variable is injected into all templates via the `inject_timezone` context processor.
 
+## Language
+
+All code, comments, variable names, log messages, UI strings, and documentation must be written in **English**.
+
 ## Utility scripts
 
 - `reset_db.py` — drops and recreates the database (destructive)
