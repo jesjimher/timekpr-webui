@@ -120,6 +120,7 @@ def dashboard():
         username_groups.setdefault(u.username, []).append(u)
 
     today = date.today()
+    offline = task_manager.get_offline_hosts()
     groups = []
 
     for username, members in sorted(username_groups.items()):
@@ -191,7 +192,7 @@ def dashboard():
 
         groups.append({
             'username': username,
-            'hosts': [{'id': m.id, 'ip': m.system_ip} for m in members],
+            'hosts': [{'id': m.id, 'ip': m.system_ip, 'offline': m.system_ip in offline} for m in members],
             'ids': [m.id for m in members],
             'primary_user_id': members[0].id,
             'dates': dates,
@@ -274,6 +275,14 @@ def get_task_status():
         'success': True,
         'status': status
     })
+
+@app.route('/api/host-status')
+def host_status():
+    """Return which host IPs are currently offline (SSH failing / in backoff)."""
+    user = get_authenticated_user()
+    if not user:
+        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
+    return jsonify({'success': True, 'offline_ips': sorted(task_manager.get_offline_hosts())})
 
 @app.route('/restart-tasks')
 def restart_tasks():

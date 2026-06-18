@@ -114,6 +114,10 @@ class BackgroundTaskManager:
         }
         logger.info("Host %s in backoff for %ds (failure #%d)", hostname, delay, failures)
 
+    def get_offline_hosts(self) -> set:
+        """Hostnames whose SSH connection is currently failing (in backoff)."""
+        return set(self._host_backoff.keys())
+
     # ------------------------------------------------------------------ main loop
 
     def _run_tasks(self):
