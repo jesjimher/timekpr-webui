@@ -70,6 +70,14 @@ class Settings(db.Model):
             db.session.commit()
     
     @classmethod
+    def get_int(cls, key, default):
+        """Get a setting value as an integer, falling back to *default* on missing or invalid data."""
+        try:
+            return int(cls.get_value(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
     def check_admin_password(cls, password):
         """Check admin password against stored hash"""
         hashed_password = cls.get_value('admin_password_hash')

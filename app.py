@@ -257,11 +257,40 @@ def settings():
             except ValueError as e:
                 flash(f'Error: {str(e)}', 'danger')
 
+        elif action == 'change_sync_settings':
+            errors = []
+            int_fields = {
+                'RECONCILE_THRESHOLD':       request.form.get('reconcile_threshold', ''),
+                'RECONCILE_ACTIVE_INTERVAL': request.form.get('reconcile_active_interval', ''),
+                'RECONCILE_IDLE_INTERVAL':   request.form.get('reconcile_idle_interval', ''),
+            }
+            for key, raw in int_fields.items():
+                try:
+                    val = int(raw)
+                    if val <= 0:
+                        raise ValueError
+                except (ValueError, TypeError):
+                    errors.append(f'Invalid value for {key}: must be a positive integer.')
+            if errors:
+                for msg in errors:
+                    flash(msg, 'danger')
+            else:
+                for key, raw in int_fields.items():
+                    Settings.set_value(key, str(int(raw)))
+                skip = 'true' if request.form.get('skip_active_host') == 'on' else 'false'
+                Settings.set_value('SKIP_ACTIVE_HOST', skip)
+                flash('Synchronization settings updated', 'success')
+                return redirect(url_for('settings'))
+
     # Get current auth settings
     current_auth_mode = get_auth_mode()
 
     return render_template('settings.html',
-                         current_auth_mode=current_auth_mode)
+                         current_auth_mode=current_auth_mode,
+                         reconcile_threshold=Settings.get_int('RECONCILE_THRESHOLD', 300),
+                         reconcile_active_interval=Settings.get_int('RECONCILE_ACTIVE_INTERVAL', 120),
+                         reconcile_idle_interval=Settings.get_int('RECONCILE_IDLE_INTERVAL', 180),
+                         skip_active_host=Settings.get_value('SKIP_ACTIVE_HOST', 'true') == 'true')
 
 @app.route('/api/task-status')
 def get_task_status():
@@ -1030,7 +1059,19 @@ with app.app_context():
     if not Settings.get_value('AUTH_MODE', None):
         Settings.set_value('AUTH_MODE', 'local')
         print("Authentication mode initialized to: local (username/password)")
-    
+
+    # Initialize sync/reconciliation settings if they don't exist
+    _sync_defaults = {
+        'RECONCILE_THRESHOLD':       '300',
+        'RECONCILE_ACTIVE_INTERVAL': '120',
+        'RECONCILE_IDLE_INTERVAL':   '180',
+        'SKIP_ACTIVE_HOST':          'true',
+    }
+    for _key, _val in _sync_defaults.items():
+        if Settings.get_value(_key) is None:
+            Settings.set_value(_key, _val)
+    print("Sync settings initialized")
+
     # Start background tasks automatically
     task_manager.start()
     print("Background tasks started automatically")

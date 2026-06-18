@@ -161,6 +161,85 @@
                 </div>
             </div>
 
+            <!-- Synchronization Settings Card -->
+            <div class="card">
+                <div class="card-header">
+                    <div style="display: flex; align-items: center; gap: var(--space-3);">
+                        <svg width="24" height="24" fill="var(--text-secondary)" viewBox="0 0 16 16">
+                            <path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+                            <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+                        </svg>
+                        <div>
+                            <h2>Synchronization</h2>
+                            <p style="margin: 0; color: var(--text-tertiary); font-size: var(--font-size-sm);">Control how often shared time pools are reconciled across hosts</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <form action="{{ url_for('settings') }}" method="POST">
+                        <input type="hidden" name="action" value="change_sync_settings">
+
+                        <div class="form-group">
+                            <label for="reconcile_threshold" class="form-label">Correction threshold (seconds)</label>
+                            <input type="number" id="reconcile_threshold" name="reconcile_threshold"
+                                   class="form-control" min="30" step="30"
+                                   value="{{ reconcile_threshold }}" required>
+                            <small style="color: var(--text-tertiary); display: block; margin-top: var(--space-2);">
+                                Minimum drift between the desired and current time left before a correction is pushed.
+                                Lower values keep the pool more precise but generate more updates (and desktop notifications).
+                                Default: 300 s (5 min).
+                            </small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="reconcile_active_interval" class="form-label">Check interval — active (seconds)</label>
+                            <input type="number" id="reconcile_active_interval" name="reconcile_active_interval"
+                                   class="form-control" min="30" step="30"
+                                   value="{{ reconcile_active_interval }}" required>
+                            <small style="color: var(--text-tertiary); display: block; margin-top: var(--space-2);">
+                                How often to evaluate a group when time has been used today. Default: 120 s (2 min).
+                            </small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="reconcile_idle_interval" class="form-label">Check interval — idle (seconds)</label>
+                            <input type="number" id="reconcile_idle_interval" name="reconcile_idle_interval"
+                                   class="form-control" min="30" step="30"
+                                   value="{{ reconcile_idle_interval }}" required>
+                            <small style="color: var(--text-tertiary); display: block; margin-top: var(--space-2);">
+                                How often to evaluate a group when no time has been used today. Default: 180 s (3 min).
+                            </small>
+                        </div>
+
+                        <div class="form-group">
+                            <div style="display: flex; align-items: center; gap: var(--space-3);">
+                                <input type="checkbox" id="skip_active_host" name="skip_active_host"
+                                       {% if skip_active_host %}checked{% endif %}
+                                       style="width: 18px; height: 18px; cursor: pointer;">
+                                <label for="skip_active_host" class="form-label" style="margin: 0; cursor: pointer;">
+                                    Skip corrections on the currently active host
+                                </label>
+                            </div>
+                            <small style="color: var(--text-tertiary); display: block; margin-top: var(--space-2);">
+                                When enabled, the host whose time is actively decreasing will not receive
+                                a correction push — timekpr already accounts time locally on that machine.
+                                This eliminates notifications on the screen the child is using.
+                            </small>
+                        </div>
+
+                        <div class="form-group">
+                            <button type="submit" class="btn btn-primary btn-lg" style="width: 100%;">
+                                <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M15.854 5.146a.5.5 0 0 1 0 .708l-3 3a.5.5 0 0 1-.708 0l-1.5-1.5a.5.5 0 0 1 .708-.708L12.5 7.793l2.646-2.647a.5.5 0 0 1 .708 0z"/>
+                                    <path d="M1 14s-1 0-1-1 1-4 6-4 6 3 6 4-1 1-1 1H1zm5-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/>
+                                </svg>
+                                Save Synchronization Settings
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
             <!-- Change Password Card -->
             <div class="card">
                 <div class="card-header">

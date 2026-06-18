@@ -14,6 +14,7 @@ from src.database import (
     GroupTimeAdjustment,
     get_user_groups,
     group_today_limit,
+    Settings,
 )
 from src.ssh_helper import SSHClient
 
@@ -45,6 +46,7 @@ class BackgroundTaskManager:
         self._host_backoff: dict = {}           # {hostname: {failures, next_retry}}
         self._last_full_read: dict = {}         # {user_id: datetime}
         self._last_reconcile: dict = {}         # {username: datetime}
+        self._prev_time_left: dict = {}         # {user_id: seconds} last known TIME_LEFT_DAY per host
 
     def init_app(self, app):
         self.app = app
@@ -312,12 +314,21 @@ class BackgroundTaskManager:
     def _reconcile_groups(self):
         """Enforce shared time pool across multi-host groups with adaptive cadence.
 
-        Polls active groups (usage > 0 today) every _RECONCILE_ACTIVE seconds,
-        idle groups every _RECONCILE_IDLE seconds.
+        Polls active groups (usage > 0 today) every RECONCILE_ACTIVE_INTERVAL seconds,
+        idle groups every RECONCILE_IDLE_INTERVAL seconds.
+
+        Reconciliation parameters are read from the Settings table each cycle so they
+        can be adjusted through the web UI without restarting the server.
         """
         groups = get_user_groups()
         today = date.today()
         now = datetime.utcnow()
+
+        # Read configurable parameters from Settings (fall back to class defaults)
+        threshold = Settings.get_int('RECONCILE_THRESHOLD', self._RECONCILE_THRESHOLD)
+        active_interval = Settings.get_int('RECONCILE_ACTIVE_INTERVAL', self._RECONCILE_ACTIVE)
+        idle_interval = Settings.get_int('RECONCILE_IDLE_INTERVAL', self._RECONCILE_IDLE)
+        skip_active_host = Settings.get_value('SKIP_ACTIVE_HOST', 'true') == 'true'
 
         for username, members in groups.items():
             if len(members) < 2:
@@ -330,7 +341,7 @@ class BackgroundTaskManager:
                     for m in members
                 )
 
-                interval = self._RECONCILE_ACTIVE if total_spent > 0 else self._RECONCILE_IDLE
+                interval = active_interval if total_spent > 0 else idle_interval
                 last = self._last_reconcile.get(username)
                 if last and (now - last).total_seconds() < interval:
                     continue
@@ -342,8 +353,8 @@ class BackgroundTaskManager:
 
                 desired = max(0, limit - total_spent)
                 logger.info(
-                    "Group '%s': limit=%ds spent=%ds desired=%ds",
-                    username, limit, total_spent, desired,
+                    "Group '%s': limit=%ds spent=%ds desired=%ds threshold=%ds",
+                    username, limit, total_spent, desired, threshold,
                 )
 
                 any_host_reached = False
@@ -354,10 +365,22 @@ class BackgroundTaskManager:
                             continue
 
                         any_host_reached = True
+
+                        # Skip the host that is actively consuming time to avoid showing
+                        # a "time changed" notification on the screen the user is using.
+                        if skip_active_host:
+                            prev_left = self._prev_time_left.get(m.id)
+                            if prev_left is not None and current_left < prev_left:
+                                logger.info("%s@%s: skipping active host (left %d→%d)",
+                                            username, m.system_ip, prev_left, current_left)
+                                self._prev_time_left[m.id] = current_left
+                                continue
+                        self._prev_time_left[m.id] = current_left
+
                         delta = desired - current_left
-                        if abs(delta) < self._RECONCILE_THRESHOLD:
-                            logger.info("%s@%s: delta=%ds < threshold, no adjustment",
-                                        username, m.system_ip, delta)
+                        if abs(delta) < threshold:
+                            logger.info("%s@%s: delta=%ds < threshold=%ds, no adjustment",
+                                        username, m.system_ip, delta, threshold)
                             continue
 
                         if not self._host_ready(m.system_ip):
