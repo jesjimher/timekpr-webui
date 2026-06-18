@@ -21,4 +21,4 @@ instance/
 *.db
 
 # Claude Code project instructions (local development only)
-CLAUDE.md
+#CLAUDE.md
