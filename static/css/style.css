@@ -474,14 +474,18 @@ p {
   align-items: center;
 }
 
-.host-offline-dot {
+.host-status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--danger);
+  background: var(--success);
   margin-right: var(--space-1);
   flex-shrink: 0;
   cursor: default;
+}
+
+.host-status-dot.offline {
+  background: var(--danger);
 }
 
 /* Status Indicators */

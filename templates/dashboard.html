@@ -101,9 +101,15 @@
                         const offlineSet = new Set(data.offline_ips);
                         document.querySelectorAll('.host-entry').forEach(el => {
                             const ip = el.dataset.hostIp;
-                            const badge = el.querySelector('.host-offline-dot');
-                            if (badge) badge.style.display = offlineSet.has(ip) ? 'inline-block' : 'none';
-                            if (badge) badge.title = offlineSet.has(ip) ? 'This computer is offline' : '';
+                            const badge = el.querySelector('.host-status-dot');
+                            if (!badge) return;
+                            if (offlineSet.has(ip)) {
+                                badge.classList.add('offline');
+                                badge.title = 'This computer is offline';
+                            } else {
+                                badge.classList.remove('offline');
+                                badge.title = 'This computer is online';
+                            }
                         });
                     })
                     .catch(() => {});
@@ -134,7 +140,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <p class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}"><span class="host-offline-dot" style="display: {{ 'inline-block' if host.offline else 'none' }};" title="This computer is offline"></span>{{ host.ip }}</span>{% if not loop.last %}, {% endif %}
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}</span>{% if not loop.last %}, {% endif %}
                                     {%- endfor -%}
                                 </p>
                             </div>
