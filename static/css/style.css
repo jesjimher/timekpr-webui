@@ -488,6 +488,12 @@ p {
   background: var(--danger);
 }
 
+.in-use-label {
+  font-size: var(--font-size-xs);
+  color: var(--success);
+  font-weight: 500;
+}
+
 /* Status Indicators */
 .status-indicator {
   display: inline-flex;

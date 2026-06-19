@@ -47,6 +47,7 @@ class BackgroundTaskManager:
         self._last_full_read: dict = {}         # {user_id: datetime}
         self._last_reconcile: dict = {}         # {username: datetime}
         self._prev_time_left: dict = {}         # {user_id: seconds} last known TIME_LEFT_DAY per host
+        self._logged_in_users: dict = {}        # {user_id: bool} whether user has an active session
 
     def init_app(self, app):
         self.app = app
@@ -119,6 +120,10 @@ class BackgroundTaskManager:
     def get_offline_hosts(self) -> set:
         """Hostnames whose SSH connection is currently failing (in backoff)."""
         return set(self._host_backoff.keys())
+
+    def get_logged_in_users(self) -> set:
+        """User IDs where the managed user currently has an active session."""
+        return {uid for uid, logged_in in self._logged_in_users.items() if logged_in}
 
     # ------------------------------------------------------------------ main loop
 
@@ -270,6 +275,7 @@ class BackgroundTaskManager:
                     try:
                         with SSHClient(hostname=user.system_ip) as ssh:
                             is_valid, result_message, config_dict = ssh.validate_user(user.username)
+                            self._logged_in_users[user.id] = ssh.is_user_logged_in(user.username)
                         self._record_success(user.system_ip)
                         self._last_full_read[user.id] = now
 

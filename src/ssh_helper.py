@@ -118,6 +118,11 @@ class SSHClient:
                 config_dict[key] = value
         return config_dict
 
+    def is_user_logged_in(self, username):
+        """Return True if *username* has an active session according to `who`."""
+        _, output, _ = self._exec(f'who | grep -w {username}')
+        return bool(output.strip())
+
     def modify_time_left(self, username, operation, seconds):
         """
         Modify time left using timekpra --settimeleft.

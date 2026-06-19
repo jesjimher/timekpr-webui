@@ -121,6 +121,7 @@ def dashboard():
 
     today = date.today()
     offline = task_manager.get_offline_hosts()
+    logged_in_users = task_manager.get_logged_in_users()
     groups = []
 
     for username, members in sorted(username_groups.items()):
@@ -192,7 +193,7 @@ def dashboard():
 
         groups.append({
             'username': username,
-            'hosts': [{'id': m.id, 'ip': m.system_ip, 'offline': m.system_ip in offline} for m in members],
+            'hosts': [{'id': m.id, 'ip': m.system_ip, 'offline': m.system_ip in offline, 'in_use': m.id in logged_in_users} for m in members],
             'ids': [m.id for m in members],
             'primary_user_id': members[0].id,
             'dates': dates,
