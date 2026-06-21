@@ -1026,6 +1026,7 @@ def group_adjust_pool(username):
         adj = GroupTimeAdjustment(username=username, date=today, extra_seconds=signed)
         db.session.add(adj)
     db.session.commit()
+    task_manager.trigger_sync()
 
     total_min = adj.extra_seconds // 60
     sign_str = '+' if total_min >= 0 else ''

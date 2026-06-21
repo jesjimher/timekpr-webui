@@ -347,9 +347,17 @@ class BackgroundTaskManager:
                     for m in members
                 )
 
+                # Check for pending unreconciled pool adjustment — if present, skip
+                # the normal cadence check so the change is applied immediately.
+                pending_adj = GroupTimeAdjustment.query.filter_by(
+                    username=username, date=today
+                ).first()
+                has_pending_adj = bool(pending_adj and pending_adj.reconciled_at is None
+                                       and pending_adj.extra_seconds != 0)
+
                 interval = active_interval if total_spent > 0 else idle_interval
                 last = self._last_reconcile.get(username)
-                if last and (now - last).total_seconds() < interval:
+                if not has_pending_adj and last and (now - last).total_seconds() < interval:
                     continue
 
                 limit = group_today_limit(username)
