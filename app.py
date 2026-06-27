@@ -1001,7 +1001,19 @@ def group_adjust_pool(username):
                 user.last_config = json.dumps(config_dict)
                 user.pending_time_adjustment = None
                 user.pending_time_operation = None
-                db.session.commit()
+            # Update GroupTimeAdjustment so the dashboard limit reflects the extra time
+            signed = seconds if operation == '+' else -seconds
+            adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
+            if adj:
+                adj.extra_seconds += signed
+                adj.reconciled_at = datetime.utcnow()
+            else:
+                adj = GroupTimeAdjustment(
+                    username=username, date=today,
+                    extra_seconds=signed, reconciled_at=datetime.utcnow(),
+                )
+                db.session.add(adj)
+            db.session.commit()
             return jsonify({'success': True, 'message': message, 'refresh': True})
         else:
             user.pending_time_adjustment = seconds

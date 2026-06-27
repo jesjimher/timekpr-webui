@@ -208,14 +208,27 @@ class BackgroundTaskManager:
         """Apply all pending changes for one user over an already-open SSH connection."""
         # --- time adjustment ---
         if user.pending_time_adjustment is not None and user.pending_time_operation is not None:
+            adjustment = user.pending_time_adjustment
+            op = user.pending_time_operation
             logger.info("Applying pending time adjustment for %s: %s%ds",
-                        user.username, user.pending_time_operation, user.pending_time_adjustment)
-            success, message = ssh.modify_time_left(
-                user.username, user.pending_time_operation, user.pending_time_adjustment
-            )
+                        user.username, op, adjustment)
+            success, message = ssh.modify_time_left(user.username, op, adjustment)
             if success:
                 user.pending_time_adjustment = None
                 user.pending_time_operation = None
+                signed = adjustment if op == '+' else -adjustment
+                today = date.today()
+                adj = GroupTimeAdjustment.query.filter_by(
+                    username=user.username, date=today
+                ).first()
+                if adj:
+                    adj.extra_seconds += signed
+                    adj.reconciled_at = datetime.utcnow()
+                else:
+                    db.session.add(GroupTimeAdjustment(
+                        username=user.username, date=today,
+                        extra_seconds=signed, reconciled_at=datetime.utcnow(),
+                    ))
                 db.session.commit()
                 logger.info("Cleared pending time adjustment for %s", user.username)
             else:
