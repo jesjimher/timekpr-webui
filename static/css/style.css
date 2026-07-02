@@ -678,6 +678,7 @@ p {
   letter-spacing: 0.07em;
   margin-bottom: var(--space-3);
   color: var(--text-tertiary);
+  text-align: center;
 }
 
 .chart-container {
