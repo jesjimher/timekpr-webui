@@ -422,6 +422,11 @@ p {
   display: inline-flex;
   flex-direction: column;
   align-items: flex-start;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  padding: var(--space-1) var(--space-3);
+  margin: var(--space-1) var(--space-1) var(--space-1) 0;
 }
 
 .host-entry-name {
@@ -626,6 +631,9 @@ p {
 }
 
 .user-location {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
   margin: 0;
