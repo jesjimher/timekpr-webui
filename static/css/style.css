@@ -1010,10 +1010,6 @@ p {
     gap: var(--space-4);
   }
   
-  .user-stats {
-    grid-template-columns: 1fr;
-  }
-  
   .user-actions {
     flex-direction: column;
   }
