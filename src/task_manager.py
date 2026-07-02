@@ -181,11 +181,11 @@ class BackgroundTaskManager:
                     if not has_pending:
                         continue
 
-                    if not self._host_ready(user.system_ip):
-                        logger.info("Host %s in backoff, skipping push for %s",
-                                    user.system_ip, user.username)
-                        continue
-
+                    # Pending changes are user-initiated (time adjustment, schedule,
+                    # intervals) and should be applied ASAP, so they bypass the
+                    # offline backoff. A failed attempt still records the failure
+                    # (offline indicator + read backoff) but we keep retrying the
+                    # push every cycle until it lands.
                     logger.info("Pushing pending changes for %s @ %s", user.username, user.system_ip)
                     try:
                         with SSHClient(hostname=user.system_ip) as ssh:
@@ -410,7 +410,9 @@ class BackgroundTaskManager:
                                         username, m.system_ip, delta, threshold)
                             continue
 
-                        if not self._host_ready(m.system_ip):
+                        # A pending manual pool adjustment bypasses the backoff so
+                        # the change is pushed to every host without waiting.
+                        if not has_pending_adj and not self._host_ready(m.system_ip):
                             logger.info("Host %s in backoff, skipping reconciliation", m.system_ip)
                             continue
 

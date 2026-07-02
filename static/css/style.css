@@ -494,6 +494,12 @@ p {
   font-weight: 500;
 }
 
+.host-synced {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted, #888);
+  margin-left: var(--space-1);
+}
+
 /* Status Indicators */
 .status-indicator {
   display: inline-flex;

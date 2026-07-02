@@ -1,12 +1,18 @@
 import paramiko
 import re
 import os
+import socket
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class SSHClient:
+    # Hard wall-clock limit for each remote command. Without this a host that
+    # goes to sleep or drops the network mid-command leaves recv_exit_status()
+    # blocked forever, which would freeze the single background sync thread.
+    COMMAND_TIMEOUT = 15  # seconds
+
     def __init__(self, hostname, username='timekpr-remote', key_path=None, port=22):
         self.hostname = hostname
         self.username = username
@@ -46,6 +52,11 @@ class SSHClient:
             port=self.port,
             timeout=10,
         )
+        # Keepalive so a silently-dead peer (suspended laptop, dropped Wi-Fi)
+        # tears the transport down instead of leaving reads blocked forever.
+        transport = client.get_transport()
+        if transport:
+            transport.set_keepalive(5)
         self._client = client
         logger.debug("SSH connected to %s", self.hostname)
 
@@ -69,12 +80,29 @@ class SSHClient:
         self.disconnect()
 
     def _exec(self, command, sudo_on_fail=False):
-        """Run a command on the open connection; retry with sudo on non-zero exit if requested."""
+        """Run a command on the open connection; retry with sudo on non-zero exit if requested.
+
+        Bounded by COMMAND_TIMEOUT: if the host stalls, we drop the connection
+        and raise so the caller treats it as offline (queue + backoff) instead
+        of hanging the background sync thread indefinitely.
+        """
         self.connect()
-        stdin, stdout, stderr = self._client.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
-        out = stdout.read().decode('utf-8')
-        err = stderr.read().decode('utf-8')
+        try:
+            stdin, stdout, stderr = self._client.exec_command(
+                command, timeout=self.COMMAND_TIMEOUT
+            )
+            channel = stdout.channel
+            channel.settimeout(self.COMMAND_TIMEOUT)
+            # Read output first (bounded by the channel timeout), then fetch the
+            # exit status, which is delivered once the channel reaches EOF/close.
+            out = stdout.read().decode('utf-8')
+            err = stderr.read().decode('utf-8')
+            exit_status = channel.recv_exit_status()
+        except (socket.timeout, EOFError) as e:
+            logger.warning("Command on %s timed out/dropped after %ds: %s (%s)",
+                           self.hostname, self.COMMAND_TIMEOUT, command, e)
+            self.disconnect()  # force a fresh connection on the next attempt
+            raise TimeoutError(f"Command timed out on {self.hostname}: {command}")
 
         if exit_status != 0 and sudo_on_fail and not command.startswith('sudo '):
             logger.debug("Retrying with sudo: %s", command)
