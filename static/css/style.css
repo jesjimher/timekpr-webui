@@ -444,10 +444,9 @@ p {
 }
 
 .host-synced {
-  font-size: var(--font-size-xs);
+  font-size: 0.8em;
   color: var(--text-muted);
-  margin-left: var(--space-2);
-  font-style: italic;
+
 }
 
 /* ── Status indicators ───────────────────────────────────────────────── */
