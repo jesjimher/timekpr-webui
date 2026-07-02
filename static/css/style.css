@@ -634,7 +634,7 @@ p {
 /* User Grid */
 .users-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(400px, 100%), 1fr));
   gap: var(--space-6);
   margin-bottom: var(--space-8);
 }
@@ -1048,8 +1048,35 @@ p {
   .modal-footer {
     flex-direction: column;
   }
-  
+
+  /* Keep the −/+ buttons flanking the field on mobile, not stacked */
   .time-controls {
-    flex-direction: column;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    flex: 1;
+  }
+
+  .time-controls .time-input {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    max-width: 120px;
+  }
+
+  .time-controls .time-btn {
+    flex-shrink: 0;
+  }
+}
+
+/* Phone breakpoint: shared fine-tuning */
+@media (max-width: 480px) {
+  .dashboard-header {
+    padding: var(--space-4);
+  }
+
+  .btn {
+    padding: var(--space-2) var(--space-3);
   }
 }

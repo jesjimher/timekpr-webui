@@ -6,6 +6,19 @@
     <title>TimeKpr webUI Admin Panel</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <script src="{{ url_for('static', filename='js/theme.js') }}"></script>
+    <style>
+        .add-user-form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            gap: var(--space-4);
+            align-items: end;
+        }
+        @media (max-width: 600px) {
+            .add-user-form-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
 </head>
 <body>
     <div class="dashboard-container">
@@ -98,7 +111,7 @@
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('add_user') }}" method="POST">
-                        <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: var(--space-4); align-items: end;">
+                        <div class="add-user-form-grid">
                             <div class="form-group">
                                 <label for="username" class="form-label">Username</label>
                                 <input type="text" id="username" name="username" class="form-control" placeholder="Enter username" required>

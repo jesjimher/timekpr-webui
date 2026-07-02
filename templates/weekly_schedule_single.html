@@ -38,11 +38,23 @@
             border: 1px solid var(--border-primary);
         }
         
-        .quick-control label {
+        .quick-label {
             font-size: var(--font-size-sm);
             font-weight: 500;
             color: var(--text-secondary);
             white-space: nowrap;
+        }
+
+        .quick-stepper {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
+        }
+
+        .quick-actions {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
         }
         
         .quick-input {
@@ -217,29 +229,81 @@
         }
         
         @media (max-width: 968px) {
-            .schedule-header-row,
+            /* Hide the desktop table header; each stacked row is self-describing */
+            .schedule-header-row {
+                display: none;
+            }
+
             .schedule-row {
                 grid-template-columns: 1fr;
                 gap: var(--space-3);
             }
-            
+
             .time-section {
                 justify-content: space-between;
                 padding: var(--space-3);
                 background: var(--bg-secondary);
                 border-radius: var(--radius-md);
             }
-            
+
+            /* Let the −/+ field group grow to fill the stacked row width */
+            .time-controls {
+                flex: 1;
+                justify-content: center;
+            }
+
+            .time-controls .time-input {
+                flex: 1;
+                width: auto;
+                min-width: 0;
+                max-width: 140px;
+            }
+
             .interval-controls {
                 flex-wrap: wrap;
                 justify-content: space-between;
+                width: 100%;
+                gap: var(--space-2);
             }
-            
+
+            .interval-time {
+                flex: 1;
+                justify-content: flex-end;
+            }
+
+            .interval-time .time-select {
+                flex: 1;
+                min-width: 0;
+                max-width: 120px;
+            }
+
             .schedule-controls {
                 flex-direction: column;
             }
-            
+
             .quick-control {
+                flex-wrap: wrap;
+                gap: var(--space-3);
+            }
+
+            .quick-label {
+                width: 100%;
+                font-size: var(--font-size-sm);
+                font-weight: 600;
+            }
+
+            .quick-stepper {
+                width: 100%;
+                justify-content: center;
+            }
+
+            .quick-stepper .time-select {
+                flex: 1;
+                min-width: 0;
+            }
+
+            .quick-actions {
+                width: 100%;
                 justify-content: space-between;
             }
         }
@@ -289,7 +353,7 @@
         <div class="schedule-main">
             <!-- Status Overview -->
             <div class="schedule-overview">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4);">
+                <div style="display: flex; flex-wrap: wrap; gap: var(--space-3); justify-content: space-between; align-items: center; margin-bottom: var(--space-4);">
                     <div>
                         <h2 style="margin: 0;">{{ user.username }}</h2>
                         <p style="margin: 0; color: var(--text-secondary); font-family: monospace;">{{ hosts_str }}</p>
@@ -309,7 +373,7 @@
                     {% set total_week = schedule['monday'] + schedule['tuesday'] + schedule['wednesday'] + schedule['thursday'] + schedule['friday'] %}
                     {% set total_weekend = schedule['saturday'] + schedule['sunday'] %}
                     {% set total_all = total_week + total_weekend %}
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-4); margin-bottom: var(--space-4);">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: var(--space-4); margin-bottom: var(--space-4);">
                         <div style="text-align: center; padding: var(--space-3); background: var(--bg-secondary); border-radius: var(--radius-md);">
                             <div style="font-size: var(--font-size-2xl); font-weight: 700; color: var(--accent-primary);">{{ total_all }}h</div>
                             <div style="font-size: var(--font-size-sm); color: var(--text-tertiary);">Total per week</div>
@@ -329,30 +393,38 @@
             <!-- Quick Controls -->
             <div class="schedule-controls">
                 <div class="quick-control">
-                    <label>Quick set hours:</label>
-                    <button type="button" class="btn btn-sm btn-ghost" onclick="adjustBulkTime(-0.25)">-15min</button>
-                    <input type="number" id="bulk-hours" min="0" max="24" step="0.25" placeholder="2.5" class="quick-input">
-                    <button type="button" class="btn btn-sm btn-ghost" onclick="adjustBulkTime(0.25)">+15min</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdays()">Weekdays</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekends()">Weekends</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="setAllDays()">All Days</button>
+                    <span class="quick-label">Quick set hours:</span>
+                    <div class="quick-stepper">
+                        <button type="button" class="btn btn-sm btn-ghost" onclick="adjustBulkTime(-0.25)">-15min</button>
+                        <input type="number" id="bulk-hours" min="0" max="24" step="0.25" placeholder="2.5" class="quick-input">
+                        <button type="button" class="btn btn-sm btn-ghost" onclick="adjustBulkTime(0.25)">+15min</button>
+                    </div>
+                    <div class="quick-actions">
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdays()">Weekdays</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekends()">Weekends</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="setAllDays()">All Days</button>
+                    </div>
                 </div>
                 <div class="quick-control">
-                    <label>Quick set interval:</label>
-                    <select id="bulk-start" class="time-select">
-                        {% for h in range(24) %}
-                        <option value="{{ h }}" {% if h == 9 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                        {% endfor %}
-                    </select>
-                    <span>to</span>
-                    <select id="bulk-end" class="time-select">
-                        {% for h in range(24) %}
-                        <option value="{{ h }}" {% if h == 17 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                        {% endfor %}
-                    </select>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdayIntervals()">Weekdays</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekendIntervals()">Weekends</button>
-                    <button type="button" class="btn btn-sm btn-secondary" onclick="setAllIntervals()">All Days</button>
+                    <span class="quick-label">Quick set interval:</span>
+                    <div class="quick-stepper">
+                        <select id="bulk-start" class="time-select">
+                            {% for h in range(24) %}
+                            <option value="{{ h }}" {% if h == 9 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
+                            {% endfor %}
+                        </select>
+                        <span>to</span>
+                        <select id="bulk-end" class="time-select">
+                            {% for h in range(24) %}
+                            <option value="{{ h }}" {% if h == 17 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="quick-actions">
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdayIntervals()">Weekdays</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekendIntervals()">Weekends</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="setAllIntervals()">All Days</button>
+                    </div>
                 </div>
             </div>
             

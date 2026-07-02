@@ -99,7 +99,7 @@
                                     {% endif %}
                                     <div class="schedule-controls">
                                         <label style="font-weight: 500;">Quick set (Mon-Fri):</label>
-                                        <input type="number" id="weekday-hours-{{ user.id }}" min="0" max="24" step="0.5" placeholder="Hours" class="form-control" style="width: 100px;">
+                                        <input type="number" id="weekday-hours-{{ user.id }}" min="0" max="24" step="0.5" placeholder="Hours" class="form-control" style="max-width: 100px; width: 100%;">
                                         <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdayHours({{ user.id }})">Apply to Weekdays</button>
                                     </div>
                                 </div>
