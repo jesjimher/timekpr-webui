@@ -30,7 +30,8 @@ class BackgroundTaskManager:
 
     # Offline backoff: delay = min(failures * base, max)
     _BACKOFF_BASE = 30          # seconds per failure
-    _BACKOFF_MAX = 300          # 5 minutes maximum
+    _BACKOFF_MAX = 300          # 5 minutes maximum (used for usage reads)
+    _PUSH_BACKOFF_MAX = 60      # shorter cap for user-initiated pending pushes
 
     # Reconciliation cadence for multi-host groups
     _RECONCILE_ACTIVE = 30      # seconds when usage is active today
@@ -43,7 +44,7 @@ class BackgroundTaskManager:
         self.last_error = None
         self._task_lock = threading.Lock()
         self._sync_event = threading.Event()   # wakes the loop early on UI save
-        self._host_backoff: dict = {}           # {hostname: {failures, next_retry}}
+        self._host_backoff: dict = {}           # {hostname: {failures, last_attempt}}
         self._last_full_read: dict = {}         # {user_id: datetime}
         self._last_reconcile: dict = {}         # {username: datetime}
         self._prev_time_left: dict = {}         # {user_id: seconds} last known TIME_LEFT_DAY per host
@@ -96,11 +97,19 @@ class BackgroundTaskManager:
 
     # ------------------------------------------------------------------ backoff
 
-    def _host_ready(self, hostname: str) -> bool:
+    def _host_ready(self, hostname: str, max_delay: int = None) -> bool:
+        """Whether a host is ready to be contacted again after past failures.
+
+        ``max_delay`` caps the backoff for this particular check. Reads use the
+        default (long) cap; user-initiated pending pushes pass a short cap so an
+        urgent change is retried much sooner without hammering a dead host.
+        """
         state = self._host_backoff.get(hostname)
         if not state:
             return True
-        return datetime.utcnow() >= state['next_retry']
+        cap = self._BACKOFF_MAX if max_delay is None else max_delay
+        delay = min(state['failures'] * self._BACKOFF_BASE, cap)
+        return datetime.utcnow() >= state['last_attempt'] + timedelta(seconds=delay)
 
     def _record_success(self, hostname: str):
         if hostname in self._host_backoff:
@@ -110,12 +119,14 @@ class BackgroundTaskManager:
     def _record_failure(self, hostname: str):
         state = self._host_backoff.get(hostname, {'failures': 0})
         failures = state['failures'] + 1
-        delay = min(failures * self._BACKOFF_BASE, self._BACKOFF_MAX)
         self._host_backoff[hostname] = {
             'failures': failures,
-            'next_retry': datetime.utcnow() + timedelta(seconds=delay),
+            'last_attempt': datetime.utcnow(),
         }
-        logger.info("Host %s in backoff for %ds (failure #%d)", hostname, delay, failures)
+        delay = min(failures * self._BACKOFF_BASE, self._BACKOFF_MAX)
+        logger.info("Host %s in backoff (read %ds, push %ds; failure #%d)",
+                    hostname, delay,
+                    min(failures * self._BACKOFF_BASE, self._PUSH_BACKOFF_MAX), failures)
 
     def get_offline_hosts(self) -> set:
         """Hostnames whose SSH connection is currently failing (in backoff)."""
@@ -182,10 +193,15 @@ class BackgroundTaskManager:
                         continue
 
                     # Pending changes are user-initiated (time adjustment, schedule,
-                    # intervals) and should be applied ASAP, so they bypass the
-                    # offline backoff. A failed attempt still records the failure
-                    # (offline indicator + read backoff) but we keep retrying the
-                    # push every cycle until it lands.
+                    # intervals) and should be applied ASAP, so they use a short
+                    # backoff cap: an online-but-recently-flaky host recovers within
+                    # ~60s instead of up to 5 min, while a truly-dead host is still
+                    # retried at most every ~60s rather than every cycle.
+                    if not self._host_ready(user.system_ip, max_delay=self._PUSH_BACKOFF_MAX):
+                        logger.info("Host %s in push backoff, skipping push for %s",
+                                    user.system_ip, user.username)
+                        continue
+
                     logger.info("Pushing pending changes for %s @ %s", user.username, user.system_ip)
                     try:
                         with SSHClient(hostname=user.system_ip) as ssh:
@@ -410,9 +426,11 @@ class BackgroundTaskManager:
                                         username, m.system_ip, delta, threshold)
                             continue
 
-                        # A pending manual pool adjustment bypasses the backoff so
-                        # the change is pushed to every host without waiting.
-                        if not has_pending_adj and not self._host_ready(m.system_ip):
+                        # A pending manual pool adjustment uses the short push
+                        # backoff so it reaches every host quickly; routine
+                        # reconciliation uses the normal (long) cap.
+                        cap = self._PUSH_BACKOFF_MAX if has_pending_adj else None
+                        if not self._host_ready(m.system_ip, max_delay=cap):
                             logger.info("Host %s in backoff, skipping reconciliation", m.system_ip)
                             continue
 
