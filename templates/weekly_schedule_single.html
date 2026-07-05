@@ -415,9 +415,10 @@
                         </select>
                         <span>to</span>
                         <select id="bulk-end" class="time-select">
-                            {% for h in range(24) %}
+                            {% for h in range(1, 24) %}
                             <option value="{{ h }}" {% if h == 17 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
                             {% endfor %}
+                            <option value="24">23:59</option>
                         </select>
                     </div>
                     <div class="quick-actions">
@@ -486,9 +487,10 @@
                                     </select>
                                     <span>to</span>
                                     <select id="end-{{ day_num }}" class="time-select" disabled>
-                                        {% for h in range(24) %}
+                                        {% for h in range(1, 24) %}
                                         <option value="{{ h }}">{{ '%02d:00'|format(h) }}</option>
                                         {% endfor %}
+                                        <option value="24">23:59</option>
                                     </select>
                                 </div>
                             </div>
@@ -694,7 +696,8 @@
                             if (iv) {
                                 document.getElementById(`interval-${day}`).checked = iv.is_enabled;
                                 document.getElementById(`start-${day}`).value = iv.start_hour;
-                                document.getElementById(`end-${day}`).value = iv.end_hour;
+                                document.getElementById(`end-${day}`).value =
+                                    (iv.end_hour === 23 && iv.end_minute === 59) ? 24 : iv.end_hour;
                                 toggleInterval(day);
                             }
                         }
@@ -731,10 +734,12 @@
                         reject(new Error(msg));
                         return;
                     }
+                    const endsAtMidnight = endHour === 24;
                     intervalData[day] = {
                         is_enabled: enabled,
                         start_hour: startHour, start_minute: 0,
-                        end_hour: endHour,     end_minute: 0,
+                        end_hour: endsAtMidnight ? 23 : endHour,
+                        end_minute: endsAtMidnight ? 59 : 0,
                     };
                 }
 
