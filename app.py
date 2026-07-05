@@ -786,19 +786,32 @@ def get_schedule_sync_status(user_id):
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
     
     user = ManagedUser.query.get_or_404(user_id)
-    
+
+    offline = user.system_ip in task_manager.get_offline_hosts()
+    intervals_synced = UserDailyTimeInterval.query.filter_by(
+        user_id=user.id, is_synced=False
+    ).first() is None
+    last_sync_error_at = (
+        user.last_sync_error_at.strftime('%Y-%m-%d %H:%M') if user.last_sync_error_at else None
+    )
+
     if user.weekly_schedule:
         schedule_dict = user.weekly_schedule.get_schedule_dict()
         last_synced = None
         if user.weekly_schedule.last_synced:
             last_synced = user.weekly_schedule.last_synced.strftime('%Y-%m-%d %H:%M')
-        
+
         return jsonify({
             'success': True,
             'is_synced': user.weekly_schedule.is_synced,
             'schedule': schedule_dict,
             'last_synced': last_synced,
-            'last_modified': user.weekly_schedule.last_modified.strftime('%Y-%m-%d %H:%M') if user.weekly_schedule.last_modified else None
+            'last_modified': user.weekly_schedule.last_modified.strftime('%Y-%m-%d %H:%M') if user.weekly_schedule.last_modified else None,
+            'system_ip': user.system_ip,
+            'offline': offline,
+            'intervals_synced': intervals_synced,
+            'last_sync_error': user.last_sync_error,
+            'last_sync_error_at': last_sync_error_at,
         })
     else:
         return jsonify({
@@ -806,7 +819,12 @@ def get_schedule_sync_status(user_id):
             'is_synced': True,  # No schedule means no sync needed
             'schedule': None,
             'last_synced': None,
-            'last_modified': None
+            'last_modified': None,
+            'system_ip': user.system_ip,
+            'offline': offline,
+            'intervals_synced': intervals_synced,
+            'last_sync_error': user.last_sync_error,
+            'last_sync_error_at': last_sync_error_at,
         })
 
 @app.route('/stats/<int:user_id>')
@@ -1063,6 +1081,16 @@ with app.app_context():
             conn.execute(db.text("ALTER TABLE group_time_adjustment ADD COLUMN reconciled_at DATETIME"))
             conn.commit()
             print("Migrated group_time_adjustment: added reconciled_at column")
+
+        user_cols = [row[1] for row in conn.execute(db.text("PRAGMA table_info(managed_user)"))]
+        if 'last_sync_error' not in user_cols:
+            conn.execute(db.text("ALTER TABLE managed_user ADD COLUMN last_sync_error TEXT"))
+            conn.commit()
+            print("Migrated managed_user: added last_sync_error column")
+        if 'last_sync_error_at' not in user_cols:
+            conn.execute(db.text("ALTER TABLE managed_user ADD COLUMN last_sync_error_at DATETIME"))
+            conn.commit()
+            print("Migrated managed_user: added last_sync_error_at column")
 
     # Initialize admin password if it doesn't exist
     if not Settings.get_value('admin_password_hash', None) and not Settings.get_value('admin_password', None):

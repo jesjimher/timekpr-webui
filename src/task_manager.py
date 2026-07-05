@@ -220,8 +220,16 @@ class BackgroundTaskManager:
             logger.error("Error in _push_pending_changes: %s\n%s", e, traceback.format_exc())
             db.session.rollback()
 
+    def _record_sync_error(self, user, message):
+        """Persist the last push failure so the UI can surface it instead of only the log."""
+        user.last_sync_error = message
+        user.last_sync_error_at = datetime.utcnow()
+        db.session.commit()
+
     def _apply_user_changes(self, user, ssh: SSHClient):
         """Apply all pending changes for one user over an already-open SSH connection."""
+        any_failure = False
+
         # --- time adjustment ---
         if user.pending_time_adjustment is not None and user.pending_time_operation is not None:
             adjustment = user.pending_time_adjustment
@@ -249,6 +257,8 @@ class BackgroundTaskManager:
                 logger.info("Cleared pending time adjustment for %s", user.username)
             else:
                 logger.warning("Failed to apply time adjustment for %s: %s", user.username, message)
+                self._record_sync_error(user, message)
+                any_failure = True
 
         # --- weekly schedule ---
         if user.weekly_schedule and not user.weekly_schedule.is_synced:
@@ -266,6 +276,8 @@ class BackgroundTaskManager:
                     logger.info("Synced weekly schedule for %s", user.username)
                 else:
                     logger.warning("Failed to sync weekly schedule for %s: %s", user.username, message)
+                    self._record_sync_error(user, message)
+                    any_failure = True
 
         # --- time intervals ---
         unsynced_intervals = UserDailyTimeInterval.query.filter_by(
@@ -281,6 +293,14 @@ class BackgroundTaskManager:
                 logger.info("Synced %d time intervals for %s", len(unsynced_intervals), user.username)
             else:
                 logger.warning("Failed to sync time intervals for %s: %s", user.username, message)
+                self._record_sync_error(user, message)
+                any_failure = True
+
+        # Clear any previously recorded error once every pending piece went through cleanly.
+        if not any_failure and (user.last_sync_error is not None or user.last_sync_error_at is not None):
+            user.last_sync_error = None
+            user.last_sync_error_at = None
+            db.session.commit()
 
     # ------------------------------------------------------------------ read usage (slow path)
 

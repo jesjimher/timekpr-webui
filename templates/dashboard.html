@@ -75,15 +75,29 @@
                     Promise.all(
                         hostIds.map(id => fetch('/api/schedule-sync-status/' + id).then(r => r.json()))
                     ).then(results => {
-                        const anyUnsynced = results.some(d => d.success && !d.is_synced && d.schedule);
+                        // A host is "pending" if its schedule hasn't synced yet, or its
+                        // allowed-hours intervals haven't. Track why (offline vs. error)
+                        // so the badge explains what it's actually waiting for.
+                        const pending = results.filter(d =>
+                            d.success && ((d.schedule && !d.is_synced) || !d.intervals_synced)
+                        );
                         const badge    = document.getElementById('sync-status-{{ loop.index0 }}');
                         const syncText = document.getElementById('sync-text-{{ loop.index0 }}');
                         const syncIcon = document.getElementById('sync-icon-{{ loop.index0 }}');
                         if (!badge) return;
-                        if (anyUnsynced) {
+                        if (pending.length > 0) {
+                            const reasons = pending.map(d => {
+                                if (d.offline) return `Waiting for ${d.system_ip} (offline)`;
+                                if (d.last_sync_error) return `Sync failed on ${d.system_ip}`;
+                                return `Syncing ${d.system_ip}…`;
+                            });
+                            const errors = pending.filter(d => d.last_sync_error);
                             badge.className = 'badge badge-warning sync-status-badge';
                             badge.style.display = 'block';
-                            syncText.textContent = 'Schedule Not Synced';
+                            badge.title = errors.length
+                                ? errors.map(d => `${d.system_ip}: ${d.last_sync_error}`).join('\n')
+                                : '';
+                            syncText.textContent = reasons.join(' · ');
                             syncIcon.setAttribute('d', 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z');
                         } else {
                             badge.style.display = 'none';
