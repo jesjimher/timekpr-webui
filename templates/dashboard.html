@@ -176,10 +176,14 @@
                 });
             }
 
-            updateTaskStatus();
-            updateSyncStatus();
-            updateHostStatus();
-            refreshSyncLabels();
+            // The elements these touch are rendered further down in the page, so run the
+            // initial pass once the DOM has finished parsing rather than immediately here.
+            document.addEventListener('DOMContentLoaded', function() {
+                updateTaskStatus();
+                updateSyncStatus();
+                updateHostStatus();
+                refreshSyncLabels();
+            });
             setInterval(updateTaskStatus, 30000);
             setInterval(updateSyncStatus, 5000);
             setInterval(updateHostStatus, 5000);
