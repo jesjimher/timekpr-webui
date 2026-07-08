@@ -147,12 +147,43 @@
                     .catch(() => {});
             }
 
+            function relativeSyncText(isoString) {
+                const then = new Date(isoString);
+                const now = new Date();
+                const diffSec = Math.floor((now - then) / 1000);
+
+                if (diffSec < 60) return 'just now';
+
+                const diffMin = Math.floor(diffSec / 60);
+                if (diffMin < 60) return diffMin + ' min ago';
+
+                const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                const startOfThen = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+                const dayDiff = Math.round((startOfToday - startOfThen) / 86400000);
+
+                if (dayDiff === 0) return Math.floor(diffMin / 60) + ' h ago';
+                if (dayDiff === 1) return 'yesterday';
+
+                const dd = String(then.getDate()).padStart(2, '0');
+                const mm = String(then.getMonth() + 1).padStart(2, '0');
+                return dd + '/' + mm;
+            }
+
+            function refreshSyncLabels() {
+                document.querySelectorAll('[data-synced-utc]').forEach(el => {
+                    const prefix = el.dataset.syncPrefix || '';
+                    el.textContent = prefix + relativeSyncText(el.dataset.syncedUtc);
+                });
+            }
+
             updateTaskStatus();
             updateSyncStatus();
             updateHostStatus();
+            refreshSyncLabels();
             setInterval(updateTaskStatus, 30000);
             setInterval(updateSyncStatus, 5000);
             setInterval(updateHostStatus, 5000);
+            setInterval(refreshSyncLabels, 30000);
         </script>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -172,7 +203,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <div class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="Last synchronized">{% if host.last_checked %}synced {{ (host.last_checked|localtime).strftime('%H:%M') }}{% else %}never synced{% endif %}</span></span>
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="Last synchronized" data-sync-prefix="synced "{% if host.last_checked %} data-synced-utc="{{ host.last_checked.isoformat() }}Z"{% endif %}>{% if host.last_checked %}synced {{ host.last_checked|synctime }}{% else %}never synced{% endif %}</span></span>
                                     {%- endfor -%}
                                 </div>
                             </div>
@@ -187,7 +218,7 @@
                                     <div class="stat-label">Last Updated</div>
                                     <div class="stat-value">
                                         {% if group.last_checked %}
-                                            {{ (group.last_checked|localtime).strftime('%H:%M') }}
+                                            <span{% if group.last_checked %} data-synced-utc="{{ group.last_checked.isoformat() }}Z"{% endif %}>{{ group.last_checked|synctime }}</span>
                                         {% else %}
                                             Never
                                         {% endif %}

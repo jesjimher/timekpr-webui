@@ -66,6 +66,20 @@ def localtime_filter(dt):
     local_dt = dt.astimezone(LOCAL_TIMEZONE)
     return local_dt
 
+# Jinja2 filter to format a sync timestamp, showing the date too if it's not today
+@app.template_filter('synctime')
+def synctime_filter(dt):
+    """Format a UTC datetime as HH:MM, or HH:MM DD/MM if it isn't today"""
+    if dt is None:
+        return None
+
+    local_dt = localtime_filter(dt)
+    now_local = datetime.now(LOCAL_TIMEZONE)
+
+    if local_dt.date() == now_local.date():
+        return local_dt.strftime('%H:%M')
+    return local_dt.strftime('%H:%M %d/%m')
+
 # Make timezone string available to templates
 @app.context_processor
 def inject_timezone():
