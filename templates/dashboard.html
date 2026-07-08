@@ -113,6 +113,7 @@
                     .then(data => {
                         if (!data.success) return;
                         const offlineSet = new Set(data.offline_ips);
+                        const inUseSet = new Set((data.in_use_ids || []).map(String));
                         document.querySelectorAll('.host-entry').forEach(el => {
                             const ip = el.dataset.hostIp;
                             const badge = el.querySelector('.host-status-dot');
@@ -123,6 +124,23 @@
                             } else {
                                 badge.classList.remove('offline');
                                 badge.title = 'This computer is online';
+                            }
+
+                            const nameEl = el.querySelector('.host-entry-name');
+                            let label = nameEl ? nameEl.querySelector('.in-use-label') : null;
+                            const shouldBeInUse = inUseSet.has(el.dataset.hostId);
+                            if (shouldBeInUse && !label && nameEl) {
+                                label = document.createElement('span');
+                                label.className = 'in-use-label';
+                                label.textContent = '(in use)';
+                                nameEl.appendChild(document.createTextNode(' '));
+                                nameEl.appendChild(label);
+                            } else if (!shouldBeInUse && label) {
+                                const prev = label.previousSibling;
+                                if (prev && prev.nodeType === Node.TEXT_NODE && prev.textContent === ' ') {
+                                    prev.remove();
+                                }
+                                label.remove();
                             }
                         });
                     })
@@ -154,7 +172,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <div class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="Last synchronized">{% if host.last_checked %}synced {{ (host.last_checked|localtime).strftime('%H:%M') }}{% else %}never synced{% endif %}</span></span>
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="Last synchronized">{% if host.last_checked %}synced {{ (host.last_checked|localtime).strftime('%H:%M') }}{% else %}never synced{% endif %}</span></span>
                                     {%- endfor -%}
                                 </div>
                             </div>

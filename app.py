@@ -193,7 +193,7 @@ def dashboard():
 
         groups.append({
             'username': username,
-            'hosts': [{'id': m.id, 'ip': m.system_ip, 'offline': m.system_ip in offline, 'in_use': m.id in logged_in_users, 'last_checked': m.last_checked} for m in members],
+            'hosts': [{'id': m.id, 'ip': m.system_ip, 'offline': m.system_ip in offline, 'in_use': m.id in logged_in_users and m.system_ip not in offline, 'last_checked': m.last_checked} for m in members],
             'ids': [m.id for m in members],
             'primary_user_id': members[0].id,
             'dates': dates,
@@ -312,7 +312,17 @@ def host_status():
     user = get_authenticated_user()
     if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    return jsonify({'success': True, 'offline_ips': sorted(task_manager.get_offline_hosts())})
+    offline_ips = task_manager.get_offline_hosts()
+    logged_in_users = task_manager.get_logged_in_users()
+    in_use_ids = [
+        m.id for m in ManagedUser.query.filter_by(is_valid=True).all()
+        if m.id in logged_in_users and m.system_ip not in offline_ips
+    ]
+    return jsonify({
+        'success': True,
+        'offline_ips': sorted(offline_ips),
+        'in_use_ids': in_use_ids,
+    })
 
 @app.route('/restart-tasks')
 def restart_tasks():
