@@ -203,7 +203,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <div class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="Last synchronized" data-sync-prefix="synced "{% if host.last_checked %} data-synced-utc="{{ host.last_checked.isoformat() }}Z"{% endif %}>{% if host.last_checked %}synced {{ host.last_checked|synctime }}{% else %}never synced{% endif %}</span></span>
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="{% if host.last_checked %}{{ (host.last_checked|localtime).strftime('%d/%m/%Y %H:%M') }}{% else %}Last synchronized{% endif %}" data-sync-prefix="synced "{% if host.last_checked %} data-synced-utc="{{ host.last_checked.isoformat() }}Z"{% endif %}>{% if host.last_checked %}synced {{ host.last_checked|synctime }}{% else %}never synced{% endif %}</span></span>
                                     {%- endfor -%}
                                 </div>
                             </div>
@@ -218,7 +218,7 @@
                                     <div class="stat-label">Last Updated</div>
                                     <div class="stat-value">
                                         {% if group.last_checked %}
-                                            <span{% if group.last_checked %} data-synced-utc="{{ group.last_checked.isoformat() }}Z"{% endif %}>{{ group.last_checked|synctime }}</span>
+                                            <span title="{{ (group.last_checked|localtime).strftime('%d/%m/%Y %H:%M') }}"{% if group.last_checked %} data-synced-utc="{{ group.last_checked.isoformat() }}Z"{% endif %}>{{ group.last_checked|synctime }}</span>
                                         {% else %}
                                             Never
                                         {% endif %}
