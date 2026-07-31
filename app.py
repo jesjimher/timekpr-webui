@@ -13,6 +13,7 @@ from src.database import (
     UserWeeklySchedule,
     UserDailyTimeInterval,
     coerce_time_spent_day,
+    coerce_int,
     GroupTimeAdjustment,
     group_today_limit,
 )
@@ -86,6 +87,12 @@ def inject_timezone():
     """Inject timezone info into all templates"""
     return {'timezone': TIMEZONE_STR}
 
+
+def _format_hm(seconds):
+    """Format a non-negative second count as '{h}h {m}m'."""
+    h, rem = divmod(max(0, seconds), 3600)
+    return f"{h}h {rem // 60}m"
+
 @app.route('/', methods=['GET', 'POST'])
 def login():
     auth_mode = get_auth_mode()
@@ -156,35 +163,66 @@ def dashboard():
             for m in members
         ]
 
-        # --- Global time-left for the group ---
+        # --- Local budget projection (feeds the weekly chart's remaining-today
+        # segment only). This is what the app *intends*, not what's enforced --
+        # see the ground-truth block below for what the hosts actually report.
         limit_seconds = group_today_limit(username)
         total_spent_today = sum(
             (UserTimeUsage.query.filter_by(user_id=m.id, date=today).first() or
              type('_', (), {'time_spent': 0})()).time_spent
             for m in members
         )
-
-        if limit_seconds > 0:
-            remaining = max(0, limit_seconds - total_spent_today)
-            h, m_rem = divmod(remaining, 3600)
-            global_time_left = f"{h}h {m_rem // 60}m"
-            remaining_today_hours = remaining / 3600.0
-        elif len(members) == 1:
-            # Single-host, no group limit — fall back to host's own TIME_LEFT_DAY
-            tl = members[0].get_config_value('TIME_LEFT_DAY')
-            if tl is not None:
-                h, m_rem = divmod(tl, 3600)
-                global_time_left = f"{h}h {m_rem // 60}m"
-            else:
-                global_time_left = "Unknown"
-            remaining_today_hours = 0.0
+        if limit_seconds is not None:
+            pool_remaining_seconds = max(0, limit_seconds - total_spent_today)
+            remaining_today_hours = pool_remaining_seconds / 3600.0
         else:
-            global_time_left = "No limit"
+            pool_remaining_seconds = None
             remaining_today_hours = 0.0
 
-        # --- Most-recent update time across all hosts ---
-        checked_times = [m.last_checked for m in members if m.last_checked]
-        last_checked = max(checked_times) if checked_times else None
+        # --- Ground truth: what the hosts themselves report, never what the app
+        # intended. A host whose last successful read is stale is excluded so an
+        # unreachable machine can't drag a stale number into the display.
+        fresh_members = [m for m in members if not m.is_stale()]
+
+        host_left_values = [v for v in
+                             (coerce_int(m.get_config_value('TIME_LEFT_DAY')) for m in fresh_members)
+                             if v is not None]
+        enforced_time_left = max(host_left_values) if host_left_values else None
+
+        host_enforced_values = [v for v in
+                                 (m.enforced_today_seconds() for m in fresh_members)
+                                 if v is not None]
+        enforced_limit_today = max(host_enforced_values) if host_enforced_values else None
+
+        global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Unknown"
+
+        configured_limit_today = limit_seconds  # None = unconfigured, 0 = blocked today
+        show_limit_mismatch = (
+            configured_limit_today is not None and enforced_limit_today is not None
+            and abs(configured_limit_today - enforced_limit_today) > 60
+        )
+        enforced_limit_today_str = (
+            _format_hm(enforced_limit_today) if enforced_limit_today is not None else None
+        )
+        configured_limit_today_str = (
+            "blocked" if configured_limit_today == 0
+            else _format_hm(configured_limit_today) if configured_limit_today is not None
+            else None
+        )
+
+        # --- Most-recent *successful* read across all hosts ---
+        read_times = [m.last_read_ok_at for m in members if m.last_read_ok_at]
+        last_checked = max(read_times) if read_times else None
+
+        # --- Verification state: worst across hosts ---
+        host_states = [m.verification_state() for m in members]
+        if 'drift' in host_states:
+            verification = 'drift'
+        elif 'unverified' in host_states:
+            verification = 'unverified'
+        else:
+            verification = 'ok'
+        drift_details = [f"{m.system_ip}: {m.drift_detail}" for m in members if m.drift_detail]
 
         # --- Pending pool adjustment flag ---
         pool_adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
@@ -207,20 +245,33 @@ def dashboard():
 
         groups.append({
             'username': username,
-            'hosts': [{'id': m.id, 'ip': m.system_ip, 'offline': m.system_ip in offline, 'in_use': m.id in logged_in_users and m.system_ip not in offline, 'last_checked': m.last_checked} for m in members],
+            'hosts': [{
+                'id': m.id,
+                'ip': m.system_ip,
+                'offline': m.system_ip in offline,
+                'in_use': m.id in logged_in_users and m.system_ip not in offline,
+                'last_read_ok_at': m.last_read_ok_at,
+            } for m in members],
             'ids': [m.id for m in members],
             'primary_user_id': members[0].id,
             'dates': dates,
             'per_host_values': per_host_values,
             'remaining_today_hours': remaining_today_hours,
+            'pool_remaining_str': _format_hm(pool_remaining_seconds) if pool_remaining_seconds is not None else None,
             'global_time_left': global_time_left,
+            'enforced_limit_today_str': enforced_limit_today_str,
+            'configured_limit_today_str': configured_limit_today_str,
+            'show_limit_mismatch': show_limit_mismatch,
+            'verification': verification,
+            'drift_details': drift_details,
             'last_checked': last_checked,
             'has_pending': has_pending,
             'any_unsynced': any_unsynced,
             'is_multi_host': len(members) > 1,
         })
 
-    return render_template('dashboard.html', groups=groups)
+    any_alarm = any(g['verification'] in ('drift', 'unverified') for g in groups)
+    return render_template('dashboard.html', groups=groups, any_alarm=any_alarm)
 
 @app.route('/admin')
 def admin():
@@ -619,6 +670,8 @@ def update_weekly_schedule():
                     db.session.flush()
                     m.weekly_schedule = sched
                 m.weekly_schedule.set_schedule_from_dict(schedule_data)
+                # Re-arm the one-shot drift auto-repair: a manual edit is a fresh intent.
+                m.drift_repush_at = None
             db.session.commit()
             task_manager.trigger_sync()
             flash(f'Weekly schedule updated for all hosts of {group_username}', 'success')
@@ -648,6 +701,7 @@ def update_weekly_schedule():
         schedule = user.weekly_schedule
 
     schedule.set_schedule_from_dict(schedule_data)
+    user.drift_repush_at = None  # re-arm the one-shot drift auto-repair on manual edit
     try:
         db.session.commit()
         task_manager.trigger_sync()
@@ -804,11 +858,15 @@ def get_intervals_sync_status(user_id):
 
 @app.route('/api/schedule-sync-status/<int:user_id>')
 def get_schedule_sync_status(user_id):
-    """Get the sync status of a user's weekly schedule"""
+    """Get the sync/verification status of a user's weekly schedule.
+
+    All-DB-read, no SSH: this is polled by the dashboard every 5s and must stay
+    that way (see CLAUDE.md command-budget note).
+    """
     user = get_authenticated_user()
     if not user:
         return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
+
     user = ManagedUser.query.get_or_404(user_id)
 
     offline = user.system_ip in task_manager.get_offline_hosts()
@@ -818,38 +876,52 @@ def get_schedule_sync_status(user_id):
     last_sync_error_at = (
         user.last_sync_error_at.strftime('%Y-%m-%d %H:%M') if user.last_sync_error_at else None
     )
+    enforced_today = user.enforced_today_seconds()
+    configured_today = None
+    if user.weekly_schedule:
+        configured_today = user.weekly_schedule.get_schedule_dict().get(
+            ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'][date.today().weekday()], 0
+        )
+        configured_today = int(round((configured_today or 0) * 3600))
+
+    payload = {
+        'success': True,
+        'system_ip': user.system_ip,
+        'offline': offline,
+        'intervals_synced': intervals_synced,
+        'last_sync_error': user.last_sync_error,
+        'last_sync_error_at': last_sync_error_at,
+        'verification_state': user.verification_state(),
+        'drift_detail': user.drift_detail,
+        'drift_since': user.drift_since.strftime('%Y-%m-%d %H:%M') if user.drift_since else None,
+        'limits_verified_at': user.limits_verified_at.strftime('%Y-%m-%d %H:%M') if user.limits_verified_at else None,
+        'last_read_ok_at_iso': user.last_read_ok_at.isoformat() + 'Z' if user.last_read_ok_at else None,
+        'stale': user.is_stale(),
+        'time_left_day': coerce_int(user.get_config_value('TIME_LEFT_DAY')),
+        'enforced_today_seconds': enforced_today,
+        'configured_today_seconds': configured_today,
+    }
 
     if user.weekly_schedule:
         schedule_dict = user.weekly_schedule.get_schedule_dict()
         last_synced = None
         if user.weekly_schedule.last_synced:
             last_synced = user.weekly_schedule.last_synced.strftime('%Y-%m-%d %H:%M')
-
-        return jsonify({
-            'success': True,
+        payload.update({
             'is_synced': user.weekly_schedule.is_synced,
             'schedule': schedule_dict,
             'last_synced': last_synced,
             'last_modified': user.weekly_schedule.last_modified.strftime('%Y-%m-%d %H:%M') if user.weekly_schedule.last_modified else None,
-            'system_ip': user.system_ip,
-            'offline': offline,
-            'intervals_synced': intervals_synced,
-            'last_sync_error': user.last_sync_error,
-            'last_sync_error_at': last_sync_error_at,
         })
     else:
-        return jsonify({
-            'success': True,
-            'is_synced': True,  # No schedule means no sync needed
+        payload.update({
+            'is_synced': True,  # No schedule means no push pending -- but verification_state above still reports it
             'schedule': None,
             'last_synced': None,
             'last_modified': None,
-            'system_ip': user.system_ip,
-            'offline': offline,
-            'intervals_synced': intervals_synced,
-            'last_sync_error': user.last_sync_error,
-            'last_sync_error_at': last_sync_error_at,
         })
+
+    return jsonify(payload)
 
 @app.route('/stats/<int:user_id>')
 def user_stats(user_id):
@@ -1098,23 +1170,30 @@ with app.app_context():
     db.create_all()
     print("Database tables verified")
 
-    # Add reconciled_at column if it doesn't exist (migration for existing DBs)
+    # Additive, idempotent migrations for existing DBs. No migration framework is
+    # used in this project; new columns are added here, one line each.
+    _ADDITIVE_COLUMNS = {
+        'group_time_adjustment': {
+            'reconciled_at': 'DATETIME',
+        },
+        'managed_user': {
+            'last_sync_error': 'TEXT',
+            'last_sync_error_at': 'DATETIME',
+            'last_read_ok_at': 'DATETIME',
+            'limits_verified_at': 'DATETIME',
+            'drift_detail': 'TEXT',
+            'drift_since': 'DATETIME',
+            'drift_repush_at': 'DATETIME',
+        },
+    }
     with db.engine.connect() as conn:
-        cols = [row[1] for row in conn.execute(db.text("PRAGMA table_info(group_time_adjustment)"))]
-        if 'reconciled_at' not in cols:
-            conn.execute(db.text("ALTER TABLE group_time_adjustment ADD COLUMN reconciled_at DATETIME"))
-            conn.commit()
-            print("Migrated group_time_adjustment: added reconciled_at column")
-
-        user_cols = [row[1] for row in conn.execute(db.text("PRAGMA table_info(managed_user)"))]
-        if 'last_sync_error' not in user_cols:
-            conn.execute(db.text("ALTER TABLE managed_user ADD COLUMN last_sync_error TEXT"))
-            conn.commit()
-            print("Migrated managed_user: added last_sync_error column")
-        if 'last_sync_error_at' not in user_cols:
-            conn.execute(db.text("ALTER TABLE managed_user ADD COLUMN last_sync_error_at DATETIME"))
-            conn.commit()
-            print("Migrated managed_user: added last_sync_error_at column")
+        for table, columns in _ADDITIVE_COLUMNS.items():
+            existing = [row[1] for row in conn.execute(db.text(f"PRAGMA table_info({table})"))]
+            for column, sql_type in columns.items():
+                if column not in existing:
+                    conn.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
+                    conn.commit()
+                    print(f"Migrated {table}: added {column} column")
 
     # Initialize admin password if it doesn't exist
     if not Settings.get_value('admin_password_hash', None) and not Settings.get_value('admin_password', None):

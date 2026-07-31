@@ -46,6 +46,22 @@ templates/          — Jinja2 HTML templates
 2. `BackgroundTaskManager` daemon thread (10s cycle) picks up unsynced records and calls `ssh_helper.py` methods
 3. `SSHClient` connects as `timekpr-remote` user on the target machine, runs `timekpra` CLI commands
 4. On success, records are marked `is_synced=True`; on failure (offline machine), they stay queued
+5. Every read cycle (`--userinfo`, every 60s) also re-verifies the intended schedule/hours against
+   what the host itself reports (`LIMITS_PER_WEEKDAYS`, `ALLOWED_WEEKDAYS`, `ALLOWED_HOURS_<day>`),
+   using data already fetched — this costs no extra SSH. `is_synced` only means "we sent it"; a
+   mismatch here sets `ManagedUser.drift_detail`, triggers one rate-limited automatic re-push, and
+   turns the dashboard card red. `limits_verified_at` means "the host's own config confirmed it".
+   The dashboard's "Time Left Today" is read from the host's reported `TIME_LEFT_DAY`, never
+   computed locally — a locally-computed number can't reveal a limit that silently failed to apply.
+
+### Command budget (read before touching ssh_helper.py or task_manager.py)
+
+Every `timekpra` invocation raises a desktop notification on the machine's logged-in user. Writes
+in `ssh_helper.py` (`set_weekly_time_limits`, `set_allowed_hours`) are differential: they compare
+against the last known host config and skip any command whose effect the host already reports.
+Auto-repair on drift (`task_manager._schedule_drift_repush`) fires at most once per drift episode —
+never loop-retry a write the host isn't applying. Do not add new periodic host contact (the 60s
+read interval is the only recurring SSH traffic); verification reuses data that read already fetched.
 
 ### Key models (`src/database.py`)
 

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - TimeKpr WebUI</title>
+    <title>{{ '(!) ' if any_alarm else '' }}Dashboard - TimeKpr WebUI</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
     <script src="{{ url_for('static', filename='js/theme.js') }}"></script>
@@ -67,40 +67,118 @@
                     });
             }
 
-            // Poll sync status for every group; update its badge
+            // Poll sync/verification status for every group; update its badge, the
+            // top alarm banner, and the "Time Left Today" headline from ground
+            // truth. All-DB-read on the server side -- no extra host traffic.
             function updateSyncStatus() {
                 {% for group in groups %}
                 {
                     const hostIds = {{ group.ids | tojson }};
+                    const groupIdx = {{ loop.index0 }};
+                    const groupUsername = {{ group.username | tojson }};
                     Promise.all(
                         hostIds.map(id => fetch('/api/schedule-sync-status/' + id).then(r => r.json()))
                     ).then(results => {
+                        const ok = results.filter(d => d.success);
+
+                        // Worst verification state across this group's hosts.
+                        let worst = 'ok';
+                        if (ok.some(d => d.verification_state === 'drift')) worst = 'drift';
+                        else if (ok.some(d => d.verification_state === 'unverified')) worst = 'unverified';
+
                         // A host is "pending" if its schedule hasn't synced yet, or its
-                        // allowed-hours intervals haven't. Track why (offline vs. error)
-                        // so the badge explains what it's actually waiting for.
-                        const pending = results.filter(d =>
-                            d.success && ((d.schedule && !d.is_synced) || !d.intervals_synced)
-                        );
-                        const badge    = document.getElementById('sync-status-{{ loop.index0 }}');
-                        const syncText = document.getElementById('sync-text-{{ loop.index0 }}');
-                        const syncIcon = document.getElementById('sync-icon-{{ loop.index0 }}');
-                        if (!badge) return;
-                        if (pending.length > 0) {
-                            const reasons = pending.map(d => {
-                                if (d.offline) return `Waiting for ${d.system_ip} (offline)`;
-                                if (d.last_sync_error) return `Sync failed on ${d.system_ip}`;
-                                return `Syncing ${d.system_ip}…`;
-                            });
-                            const errors = pending.filter(d => d.last_sync_error);
-                            badge.className = 'badge badge-warning sync-status-badge';
-                            badge.style.display = 'block';
-                            badge.title = errors.length
-                                ? errors.map(d => `${d.system_ip}: ${d.last_sync_error}`).join('\n')
-                                : '';
-                            syncText.textContent = reasons.join(' · ');
-                            syncIcon.setAttribute('d', 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z');
-                        } else {
-                            badge.style.display = 'none';
+                        // allowed-hours intervals haven't -- independent of verification.
+                        const pending = ok.filter(d => (d.schedule && !d.is_synced) || !d.intervals_synced);
+
+                        const badge    = document.getElementById('sync-status-' + groupIdx);
+                        const syncText = document.getElementById('sync-text-' + groupIdx);
+                        const syncIcon = document.getElementById('sync-icon-' + groupIdx);
+                        const warnIconPath = 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z';
+
+                        if (badge) {
+                            if (worst === 'drift' || worst === 'unverified') {
+                                badge.className = 'badge badge-danger sync-status-badge';
+                                badge.style.display = 'block';
+                                if (worst === 'drift') {
+                                    const drifted = ok.filter(d => d.verification_state === 'drift');
+                                    syncText.textContent = 'NOT ENFORCED';
+                                    badge.title = drifted.map(d => `${d.system_ip}: ${d.drift_detail}`).join('\n');
+                                } else {
+                                    syncText.textContent = 'Limit unverified';
+                                    badge.title = ok.filter(d => d.verification_state === 'unverified')
+                                        .map(d => `${d.system_ip}: ${d.offline ? 'offline' : 'not yet verified'}`)
+                                        .join('\n');
+                                }
+                                syncIcon.setAttribute('d', warnIconPath);
+                            } else if (pending.length > 0) {
+                                const reasons = pending.map(d => {
+                                    if (d.offline) return `Waiting for ${d.system_ip} (offline)`;
+                                    if (d.last_sync_error) return `Sync failed on ${d.system_ip}`;
+                                    return `Syncing ${d.system_ip}…`;
+                                });
+                                const errors = pending.filter(d => d.last_sync_error);
+                                badge.className = 'badge badge-warning sync-status-badge';
+                                badge.style.display = 'block';
+                                badge.title = errors.length
+                                    ? errors.map(d => `${d.system_ip}: ${d.last_sync_error}`).join('\n')
+                                    : '';
+                                syncText.textContent = reasons.join(' · ');
+                                syncIcon.setAttribute('d', warnIconPath);
+                            } else {
+                                badge.style.display = 'none';
+                            }
+                        }
+
+                        // Refresh "Time Left Today" from ground truth (max TIME_LEFT_DAY
+                        // across non-stale hosts) so the headline stays live instead of
+                        // frozen at page render.
+                        const fresh = ok.filter(d => !d.stale && d.time_left_day !== null && d.time_left_day !== undefined);
+                        const timeLeftEl = document.getElementById('time-left-' + groupIdx);
+                        const fmtHM = s => `${Math.floor(Math.max(0, s) / 3600)}h ${Math.floor((Math.max(0, s) % 3600) / 60)}m`;
+                        if (timeLeftEl) {
+                            timeLeftEl.textContent = fresh.length > 0
+                                ? fmtHM(Math.max(...fresh.map(d => d.time_left_day)))
+                                : 'Unknown';
+                            timeLeftEl.classList.toggle('stat-value-danger', worst === 'drift' || worst === 'unverified');
+                        }
+
+                        const mismatchEl = document.getElementById('limit-mismatch-' + groupIdx);
+                        const withLimits = ok.filter(d => d.enforced_today_seconds != null && d.configured_today_seconds != null);
+                        if (mismatchEl && withLimits.length > 0) {
+                            const enforced = Math.max(...withLimits.map(d => d.enforced_today_seconds));
+                            const configured = withLimits[0].configured_today_seconds;
+                            if (Math.abs(enforced - configured) > 60) {
+                                const configuredStr = configured === 0 ? 'blocked' : fmtHM(configured);
+                                mismatchEl.textContent = `Host limit today: ${fmtHM(enforced)} — configured ${configuredStr}`;
+                                mismatchEl.style.display = '';
+                            } else {
+                                mismatchEl.style.display = 'none';
+                            }
+                        }
+
+                        // Reflect this group's state in the top alarm banner and the
+                        // page title, without requiring a full reload.
+                        const banner = document.getElementById('alarm-banner');
+                        const list = document.getElementById('alarm-banner-list');
+                        let item = list ? list.querySelector('[data-alarm-group="' + groupIdx + '"]') : null;
+                        if (worst === 'drift' || worst === 'unverified') {
+                            const text = worst === 'drift'
+                                ? 'NOT ENFORCED' + (badge && badge.title ? ': ' + badge.title.replace(/\n/g, '; ') : '')
+                                : 'limit unverified (host unreachable or never read)';
+                            if (!item && list) {
+                                item = document.createElement('li');
+                                item.dataset.alarmGroup = String(groupIdx);
+                                list.appendChild(item);
+                            }
+                            if (item) item.textContent = `${groupUsername} — ${text}`;
+                        } else if (item) {
+                            item.remove();
+                        }
+                        if (banner && list) {
+                            const stillAlarming = list.children.length > 0;
+                            banner.style.display = stillAlarming ? 'block' : 'none';
+                            const base = document.title.replace(/^\(!\) /, '');
+                            document.title = stillAlarming ? `(!) ${base}` : base;
                         }
                     }).catch(() => {});
                 }
@@ -198,6 +276,22 @@
             {% endif %}
         {% endwith %}
 
+        <div id="alarm-banner" class="alert alert-danger" style="display: {{ 'block' if any_alarm else 'none' }};">
+            <strong>Not verifiably enforced:</strong>
+            <ul id="alarm-banner-list" style="margin: var(--space-2) 0 0; padding-left: 1.25em;">
+                {% for group in groups if group.verification in ('drift', 'unverified') %}
+                    <li data-alarm-group="{{ loop.index0 }}">
+                        {{ group.username }} —
+                        {% if group.verification == 'drift' %}
+                            NOT ENFORCED{% if group.drift_details %}: {{ group.drift_details | join('; ') }}{% endif %}
+                        {% else %}
+                            limit unverified{% if group.last_checked %} since {{ group.last_checked|synctime }}{% endif %} (host unreachable or never read)
+                        {% endif %}
+                    </li>
+                {% endfor %}
+            </ul>
+        </div>
+
         <div class="users-grid">
             {% if groups %}
                 {% for group in groups %}
@@ -207,7 +301,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <div class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="{% if host.last_checked %}{{ (host.last_checked|localtime).strftime('%d/%m/%Y %H:%M') }}{% else %}Last synchronized{% endif %}" data-sync-prefix="synced "{% if host.last_checked %} data-synced-utc="{{ host.last_checked.isoformat() }}Z"{% endif %}>{% if host.last_checked %}synced {{ host.last_checked|synctime }}{% else %}never synced{% endif %}</span></span>
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="{% if host.last_read_ok_at %}{{ (host.last_read_ok_at|localtime).strftime('%d/%m/%Y %H:%M') }}{% else %}Last successful read{% endif %}" data-sync-prefix="synced "{% if host.last_read_ok_at %} data-synced-utc="{{ host.last_read_ok_at.isoformat() }}Z"{% endif %}>{% if host.last_read_ok_at %}synced {{ host.last_read_ok_at|synctime }}{% else %}never synced{% endif %}</span></span>
                                     {%- endfor -%}
                                 </div>
                             </div>
@@ -216,7 +310,16 @@
                             <div class="user-stats">
                                 <div class="stat-item">
                                     <div class="stat-label">Time Left Today</div>
-                                    <div class="stat-value">{{ group.global_time_left }}</div>
+                                    <div class="stat-value{{ ' stat-value-danger' if group.verification in ('drift', 'unverified') else '' }}"
+                                         id="time-left-{{ loop.index0 }}">{{ group.global_time_left }}</div>
+                                    {% if group.show_limit_mismatch %}
+                                    <div class="stat-sub stat-sub-danger" id="limit-mismatch-{{ loop.index0 }}">
+                                        Host limit today: {{ group.enforced_limit_today_str }} — configured {{ group.configured_limit_today_str }}
+                                    </div>
+                                    {% endif %}
+                                    {% if group.is_multi_host and group.pool_remaining_str %}
+                                    <div class="stat-sub">Budget left (pool): {{ group.pool_remaining_str }}</div>
+                                    {% endif %}
                                 </div>
                                 <div class="stat-item">
                                     <div class="stat-label">Last Updated</div>
@@ -239,13 +342,23 @@
                             </div>
                             {% endif %}
 
+                            {% set _needs_badge = group.verification in ('drift', 'unverified') or group.any_unsynced %}
                             <div id="sync-status-{{ loop.index0 }}"
-                                 class="badge sync-status-badge"
-                                 style="margin-bottom: var(--space-4); display: {{ 'block' if group.any_unsynced else 'none' }};">
+                                 class="badge sync-status-badge {{ 'badge-danger' if group.verification in ('drift', 'unverified') else 'badge-warning' }}"
+                                 style="margin-bottom: var(--space-4); display: {{ 'block' if _needs_badge else 'none' }};"
+                                 {% if group.drift_details %}title="{{ group.drift_details | join('&#10;') }}"{% endif %}>
                                 <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                     <path id="sync-icon-{{ loop.index0 }}" d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
                                 </svg>
-                                <span id="sync-text-{{ loop.index0 }}">Schedule Not Synced</span>
+                                <span id="sync-text-{{ loop.index0 }}">
+                                    {%- if group.verification == 'drift' -%}
+                                        NOT ENFORCED
+                                    {%- elif group.verification == 'unverified' -%}
+                                        Limit unverified{% if group.last_checked %} since {{ group.last_checked|synctime }}{% endif %}
+                                    {%- else -%}
+                                        Schedule Not Synced
+                                    {%- endif -%}
+                                </span>
                             </div>
 
                             <div class="user-actions">

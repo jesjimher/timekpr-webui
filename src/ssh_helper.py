@@ -7,11 +7,37 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _maybe_int(value):
+    """Best-effort int coercion. Returns None instead of raising or leaving a string.
+
+    timekpra can report negative values (e.g. TIME_LEFT_DAY when over budget) which
+    str.isdigit() rejects, silently leaving them as strings for arithmetic done
+    elsewhere in the app.
+    """
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 class SSHClient:
     # Hard wall-clock limit for each remote command. Without this a host that
     # goes to sleep or drops the network mid-command leaves recv_exit_status()
     # blocked forever, which would freeze the single background sync thread.
     COMMAND_TIMEOUT = 15  # seconds
+
+    # Substrings (case-insensitive) that mark a timekpra command as failed even when
+    # it exits 0 -- validate_user's own not-found check is proof some timekpra error
+    # paths don't set a non-zero exit code, so exit status alone can't be trusted for
+    # mutating commands.
+    _ERROR_MARKERS = (
+        'traceback', 'error', 'failed', 'invalid', 'not found', 'not supported',
+        'permission denied', 'must be', 'usage:', 'cannot',
+    )
+
+    # Anchored so a key can contain digits (ALLOWED_HOURS_1..7) -- the previous
+    # [A-Z_]+ pattern couldn't match those keys at all, silently dropping them.
+    _KEY_RE = re.compile(r'^\s*([A-Z][A-Z0-9_]*)\s*:\s*(.*)$')
 
     def __init__(self, hostname, username='timekpr-remote', key_path=None, port=22):
         self.hostname = hostname
@@ -104,11 +130,43 @@ class SSHClient:
             self.disconnect()  # force a fresh connection on the next attempt
             raise TimeoutError(f"Command timed out on {self.hostname}: {command}")
 
-        if exit_status != 0 and sudo_on_fail and not command.startswith('sudo '):
+        # A command can exit 0 while still having failed -- e.g. a permission error
+        # printed to stdout/stderr without a non-zero status. Without this check the
+        # sudo retry never fires for that case and the failure is recorded as success.
+        needs_sudo = exit_status != 0
+        if not needs_sudo and sudo_on_fail and self._output_error(out, err):
+            needs_sudo = True
+
+        if needs_sudo and sudo_on_fail and not command.startswith('sudo '):
             logger.debug("Retrying with sudo: %s", command)
             return self._exec('sudo ' + command)
 
         return exit_status, out, err
+
+    def _output_error(self, out, err):
+        """Return the first line in stdout/stderr that looks like a timekpra error, or None."""
+        for line in (out or '').splitlines() + (err or '').splitlines():
+            low = line.strip().lower()
+            if low and any(marker in low for marker in self._ERROR_MARKERS):
+                return line.strip()
+        return None
+
+    def _exec_checked(self, command, description, sudo_on_fail=True):
+        """Run a mutating command and treat exit-0-but-error-text output as failure too.
+
+        Used by every command that changes remote state. Read-only commands (like
+        --userinfo) keep using _exec directly since they have their own success
+        criteria and an over-eager error marker there would just be noise.
+        """
+        exit_status, out, err = self._exec(command, sudo_on_fail=sudo_on_fail)
+        if exit_status != 0:
+            detail = (err or out).strip()[:300]
+            return False, f"{description}: exit {exit_status}: {detail}"
+        bad = self._output_error(out, err)
+        if bad:
+            logger.warning("Command exited 0 but output looks like an error: %s -> %s", command, bad)
+            return False, f"{description}: {bad}"
+        return True, out
 
     def validate_user(self, username):
         """
@@ -127,18 +185,21 @@ class SSHClient:
 
     def _parse_timekpr_output(self, output):
         config_dict = {}
-        pattern = r'([A-Z_]+):\s*(.*)'
         for line in output.split('\n'):
-            match = re.search(pattern, line)
+            match = self._KEY_RE.match(line)
             if match:
                 key = match.group(1)
                 value = match.group(2).strip()
-                if value.isdigit():
-                    value = int(value)
+                as_int = _maybe_int(value)
+                if as_int is not None:
+                    value = as_int
                 elif ';' in value:
-                    value = value.split(';')
-                    if all(item.isdigit() for item in value):
-                        value = [int(item) for item in value]
+                    parts = value.split(';')
+                    coerced = [_maybe_int(item) for item in parts]
+                    if all(c is not None for c in coerced):
+                        value = coerced
+                    else:
+                        value = parts
                 elif value.lower() == 'true':
                     value = True
                 elif value.lower() == 'false':
@@ -160,101 +221,157 @@ class SSHClient:
         if operation not in ['+', '-']:
             return False, "Invalid operation. Must be '+' or '-'"
         try:
-            exit_status, output, error = self._exec(
+            success, detail = self._exec_checked(
                 f'timekpra --settimeleft {username} {operation} {seconds}',
-                sudo_on_fail=True,
+                f"Failed to modify time for {username}",
             )
-            if exit_status == 0:
+            if success:
                 return True, f"Successfully modified time for {username}: {operation}{seconds} seconds"
-            return False, f"Error modifying time: {error}"
+            return False, detail
         except Exception as e:
             return False, f"Connection error: {str(e)}"
 
-    def set_weekly_time_limits(self, username, schedule_dict):
+    def set_weekly_time_limits(self, username, schedule_dict, current_config=None):
         """
         Set daily time limits using timekpra --setalloweddays and --settimelimits.
-        schedule_dict: day names → hour values
+
+        schedule_dict: day names -> hour values (Monday..Sunday). A day with 0 (or
+        missing) hours is *blocked* for that day -- it is simply left out of the
+        allowed-days list, exactly the mechanism timekpr already uses for any
+        excluded day; clearing every day just applies that to all seven at once
+        instead of leaving the previous limits in force on the host.
+
+        current_config: the last known --userinfo config_dict for this user, if
+        available. When given, a command is skipped if the host already reports
+        the state it would produce -- every timekpra write raises a desktop
+        notification on the logged-in user's screen, so redundant writes are
+        avoided rather than re-sent every sync cycle.
+
         Returns: (success, message)
         """
         try:
             day_order = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
-            allowed_days = [
-                str(i + 1) for i, day in enumerate(day_order)
+            allowed_day_nums = [
+                i + 1 for i, day in enumerate(day_order)
                 if (schedule_dict.get(day, 0) or 0) > 0
             ]
-            if not allowed_days:
-                logger.warning("No days with time limits > 0 found")
-                return False, "No days with time limits configured"
+            desired_limits = {
+                i + 1: int(round((schedule_dict.get(day, 0) or 0) * 3600))
+                for i, day in enumerate(day_order)
+                if (schedule_dict.get(day, 0) or 0) > 0
+            }
 
-            exit_status, output, error = self._exec(
-                f"timekpra --setalloweddays {username} '{';'.join(allowed_days)}'",
-                sudo_on_fail=True,
-            )
-            if exit_status != 0:
-                return False, f"Failed to set allowed days: {error or output}"
+            current_config = current_config or {}
+            host_days_raw = current_config.get('ALLOWED_WEEKDAYS')
+            host_limits_raw = current_config.get('LIMITS_PER_WEEKDAYS')
 
-            time_limits = [
-                str(int((schedule_dict.get(day, 0) or 0) * 3600))
-                for day in day_order if (schedule_dict.get(day, 0) or 0) > 0
-            ]
-            if time_limits:
-                exit_status, output, error = self._exec(
-                    f"timekpra --settimelimits {username} '{';'.join(time_limits)}'",
-                    sudo_on_fail=True,
+            host_days = None
+            if isinstance(host_days_raw, list):
+                coerced = [_maybe_int(d) for d in host_days_raw]
+                if all(c is not None for c in coerced):
+                    host_days = set(coerced)
+            elif host_days_raw == '':
+                host_days = set()  # host explicitly reports no allowed days
+
+            days_match = host_days is not None and host_days == set(allowed_day_nums)
+
+            if not days_match:
+                days_arg = ';'.join(str(d) for d in allowed_day_nums)  # may be empty -> blocks every day
+                success, detail = self._exec_checked(
+                    f"timekpra --setalloweddays {username} '{days_arg}'",
+                    "Failed to set allowed days",
                 )
-                if exit_status != 0:
-                    return False, f"Failed to set time limits: {error or output}"
+                if not success:
+                    return False, detail
 
-            logger.info("Set time limits for %s: days=%s limits=%s", username, allowed_days, time_limits)
-            return True, f"Successfully configured time limits for {username}"
+            # LIMITS_PER_WEEKDAYS is positional against ALLOWED_WEEKDAYS on the host,
+            # not against Monday..Sunday -- zip them together rather than assuming order.
+            host_limits = None
+            if (isinstance(host_days_raw, list) and isinstance(host_limits_raw, list)
+                    and len(host_days_raw) == len(host_limits_raw)):
+                pairs = [(_maybe_int(d), _maybe_int(v)) for d, v in zip(host_days_raw, host_limits_raw)]
+                if all(d is not None and v is not None for d, v in pairs):
+                    host_limits = dict(pairs)
+            limits_match = host_limits is not None and host_limits == desired_limits
+
+            if desired_limits and not limits_match:
+                limits_arg = ';'.join(str(desired_limits[d]) for d in allowed_day_nums)
+                success, detail = self._exec_checked(
+                    f"timekpra --settimelimits {username} '{limits_arg}'",
+                    "Failed to set time limits",
+                )
+                if not success:
+                    return False, detail
+
+            if days_match and limits_match:
+                logger.debug("Weekly limits for %s already match host, nothing sent", username)
+            else:
+                logger.info("Set weekly limits for %s: days=%s limits=%s",
+                            username, allowed_day_nums, desired_limits)
+            return True, f"Weekly limits confirmed for {username}"
 
         except Exception as e:
             logger.error("Exception in set_weekly_time_limits: %s", e)
             return False, f"Connection error: {str(e)}"
 
-    def set_allowed_hours(self, username, intervals_dict):
+    def set_allowed_hours(self, username, intervals_dict, current_config=None):
         """
         Set allowed hours using timekpra --setallowedhours.
-        intervals_dict: day_of_week (1-7) → UserDailyTimeInterval
+
+        intervals_dict: day_of_week (1-7) -> UserDailyTimeInterval. A day absent
+        from the dict, disabled, or with an invalid interval means "no restriction"
+        for that day (the full 24 hours).
+
+        current_config: the last known --userinfo config_dict, used to skip days
+        whose ALLOWED_HOURS_<day> the host already reports as desired.
+
         Returns: (success, message)
         """
         try:
             day_names = ['', 'monday', 'tuesday', 'wednesday', 'thursday',
                          'friday', 'saturday', 'sunday']
+            current_config = current_config or {}
+            full_day_tokens = [str(h) for h in range(24)]
+
             success_count = 0
+            skipped_count = 0
             error_messages = []
 
             for day_num in range(1, 8):
                 interval = intervals_dict.get(day_num)
 
                 if interval and interval.is_enabled and interval.is_valid_interval():
-                    hour_specs = interval.to_timekpr_format()
-                    if hour_specs:
-                        exit_status, output, error = self._exec(
-                            f"timekpra --setallowedhours {username} {day_num} '{';'.join(hour_specs)}'",
-                            sudo_on_fail=True,
-                        )
-                        if exit_status != 0:
-                            error_messages.append(f"{day_names[day_num]}: {error or output}")
-                            continue
+                    desired_tokens = interval.to_timekpr_format() or full_day_tokens
                 else:
-                    full_day = ';'.join(str(h) for h in range(24))
-                    exit_status, output, error = self._exec(
-                        f"timekpra --setallowedhours {username} {day_num} '{full_day}'",
-                        sudo_on_fail=True,
-                    )
-                    if exit_status != 0:
-                        error_messages.append(
-                            f"{day_names[day_num]}: Failed to set full day - {error or output}"
-                        )
-                        continue
+                    desired_tokens = full_day_tokens
 
+                host_tokens_raw = current_config.get(f'ALLOWED_HOURS_{day_num}')
+                host_tokens = None
+                if isinstance(host_tokens_raw, list):
+                    host_tokens = [str(t) for t in host_tokens_raw]
+                elif isinstance(host_tokens_raw, str) and host_tokens_raw != '':
+                    host_tokens = [host_tokens_raw]
+
+                if host_tokens is not None and set(host_tokens) == set(desired_tokens):
+                    skipped_count += 1
+                    success_count += 1
+                    continue
+
+                success, detail = self._exec_checked(
+                    f"timekpra --setallowedhours {username} {day_num} '{';'.join(desired_tokens)}'",
+                    day_names[day_num],
+                )
+                if not success:
+                    error_messages.append(detail)
+                    continue
                 success_count += 1
 
-            if success_count > 0 or not error_messages:
-                return True, f"Configured allowed hours for {username}: {success_count}/7 days"
-            return False, f"Failed to configure allowed hours: {'; '.join(error_messages)}"
+            if error_messages:
+                return False, f"Configured {success_count}/7 days; failures: {'; '.join(error_messages)}"
+            logger.info("Allowed hours for %s: %d/7 days sent, %d already matched host",
+                        username, success_count - skipped_count, skipped_count)
+            return True, f"Configured allowed hours for {username}: 7/7 days"
 
         except Exception as e:
             logger.error("Exception in set_allowed_hours: %s", e)

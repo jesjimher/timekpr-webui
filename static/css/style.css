@@ -673,6 +673,21 @@ p {
   font-feature-settings: "tnum";
 }
 
+/* A limit that isn't verifiably enforced on the host -- drift or unverified state */
+.stat-value-danger {
+  color: var(--danger);
+}
+
+.stat-sub {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+
+.stat-sub-danger {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .user-actions {
   display: flex;
   gap: var(--space-2);

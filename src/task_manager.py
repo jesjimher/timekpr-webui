@@ -11,6 +11,8 @@ from src.database import (
     UserTimeUsage,
     UserDailyTimeInterval,
     coerce_time_spent_day,
+    coerce_int,
+    enforced_limits_from_config,
     GroupTimeAdjustment,
     get_user_groups,
     group_today_limit,
@@ -19,6 +21,14 @@ from src.database import (
 from src.ssh_helper import SSHClient
 
 logger = logging.getLogger(__name__)
+
+_DAY_ABBR = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+
+def _format_seconds(seconds):
+    h, rem = divmod(max(0, int(seconds)), 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m" if m else f"{h}h"
 
 
 class BackgroundTaskManager:
@@ -36,6 +46,10 @@ class BackgroundTaskManager:
     # Reconciliation cadence for multi-host groups
     _RECONCILE_ACTIVE = 30      # seconds when usage is active today
     _RECONCILE_IDLE = 60        # seconds when no usage today
+
+    # Tolerance for the configured-vs-enforced comparison, absorbing int(hours*3600)
+    # rounding; far below any limit difference that would matter in practice.
+    _DRIFT_TOLERANCE_SECONDS = 60
 
     def __init__(self, app=None):
         self.app = app
@@ -226,9 +240,110 @@ class BackgroundTaskManager:
         user.last_sync_error_at = datetime.utcnow()
         db.session.commit()
 
+    # ------------------------------------------------------------------ drift verification
+
+    def _verify_enforced_config(self, user, config_dict):
+        """Compare the intended weekly schedule/hours against what the host itself
+        just reported. Pure function of data already fetched by this read cycle --
+        issues no SSH of its own, so verifying costs nothing extra.
+
+        Returns (ok, detail, limits_drifted, hours_drifted_days):
+          ok: True if everything checked matches (or there was nothing to check).
+          detail: human-readable mismatch description, or None.
+          limits_drifted: whether the weekly schedule itself is the mismatch.
+          hours_drifted_days: set of day_of_week ints whose allowed-hours mismatch.
+        """
+        limits_detail = None
+        expected = user.expected_limits()
+        if expected is not None:
+            enforced = enforced_limits_from_config(config_dict)
+            if enforced is None:
+                limits_detail = ("Cannot read enforced limits from host "
+                                  "(ALLOWED_WEEKDAYS/LIMITS_PER_WEEKDAYS missing or unparseable)")
+            else:
+                mismatches = [d for d in range(1, 8)
+                              if abs(expected[d] - enforced.get(d, 0)) > self._DRIFT_TOLERANCE_SECONDS]
+                if mismatches:
+                    limits_detail = self._format_limit_mismatches(expected, enforced, mismatches)
+
+        hours_drifted_days = set()
+        for interval in user.time_intervals:
+            if not (interval.is_enabled and interval.is_valid_interval()):
+                continue
+            host_raw = config_dict.get(f'ALLOWED_HOURS_{interval.day_of_week}')
+            if host_raw is None:
+                continue  # host doesn't report this key -- can't verify, don't invent drift
+            desired_tokens = set(str(t) for t in (interval.to_timekpr_format() or []))
+            host_tokens = (set(str(t) for t in host_raw) if isinstance(host_raw, list)
+                           else {str(host_raw)})
+            if desired_tokens != host_tokens:
+                hours_drifted_days.add(interval.day_of_week)
+
+        hours_detail = None
+        if hours_drifted_days:
+            days = ', '.join(_DAY_ABBR[d] for d in sorted(hours_drifted_days))
+            hours_detail = f"Allowed-hours mismatch on {days}"
+
+        detail = "; ".join(p for p in (limits_detail, hours_detail) if p) or None
+        return detail is None, detail, limits_detail is not None, hours_drifted_days
+
+    @staticmethod
+    def _format_limit_mismatches(expected, enforced, mismatches):
+        """Build a tooltip-ready string, compressing consecutive days with an
+        identical (expected, enforced) pair, e.g.:
+        'Mon: host 2h30m vs configured 15m; Tue-Sun: host 1h30m vs configured 15m'
+        """
+        parts = []
+        i = 0
+        while i < len(mismatches):
+            start = mismatches[i]
+            pair = (expected[start], enforced.get(start, 0))
+            j = i
+            while (j + 1 < len(mismatches) and mismatches[j + 1] == mismatches[j] + 1
+                   and (expected[mismatches[j + 1]], enforced.get(mismatches[j + 1], 0)) == pair):
+                j += 1
+            end = mismatches[j]
+            label = _DAY_ABBR[start] if start == end else f"{_DAY_ABBR[start]}-{_DAY_ABBR[end]}"
+            parts.append(f"{label}: host {_format_seconds(pair[1])} vs configured {_format_seconds(pair[0])}")
+            i = j + 1
+        return "; ".join(parts)
+
+    def _schedule_drift_repush(self, user, now, limits_drifted, hours_drifted_days):
+        """One-shot auto-repair for a newly observed drift episode.
+
+        Marks only the subsystem(s) that actually drifted as unsynced, so the
+        existing push path re-sends the differential minimum. Never repeats
+        within the same episode: a host that ignored the write will ignore the
+        retry too, and retrying anyway is exactly how the old notification storms
+        happened. The episode clears (drift_repush_at reset) once drift clears or
+        the operator edits the schedule, re-arming one further attempt.
+        """
+        if user.drift_repush_at is not None:
+            return
+        user.drift_repush_at = now
+        if limits_drifted and user.weekly_schedule:
+            user.weekly_schedule.is_synced = False
+        if hours_drifted_days:
+            for interval in user.time_intervals:
+                if interval.day_of_week in hours_drifted_days:
+                    interval.is_synced = False
+        logger.info("Scheduling one-shot auto-repair for %s@%s (limits=%s, hours_days=%s)",
+                    user.username, user.system_ip, limits_drifted, sorted(hours_drifted_days))
+        self.trigger_sync()
+
     def _apply_user_changes(self, user, ssh: SSHClient):
         """Apply all pending changes for one user over an already-open SSH connection."""
         any_failure = False
+
+        # Last known host config, used so the ssh_helper writes below can skip any
+        # command whose effect the host already reports (each timekpra write is a
+        # desktop notification on the logged-in user's screen).
+        current_config = None
+        if user.last_config:
+            try:
+                current_config = json.loads(user.last_config)
+            except (TypeError, ValueError):
+                current_config = None
 
         # --- time adjustment ---
         if user.pending_time_adjustment is not None and user.pending_time_operation is not None:
@@ -261,31 +376,36 @@ class BackgroundTaskManager:
                 any_failure = True
 
         # --- weekly schedule ---
+        # No early-out for an all-zero schedule: that used to mark_synced() without
+        # ever contacting the host, so "clear every day" silently left the previous
+        # limits fully in force on the machine. set_weekly_time_limits blocks every
+        # day itself (empty --setalloweddays) and is a no-op write-wise if the host
+        # already reports that.
         if user.weekly_schedule and not user.weekly_schedule.is_synced:
             schedule_dict = user.weekly_schedule.get_schedule_dict()
-            _week_days = ('monday', 'tuesday', 'wednesday', 'thursday',
-                          'friday', 'saturday', 'sunday')
-            if not any((schedule_dict.get(d, 0) or 0) > 0 for d in _week_days):
+            success, message = ssh.set_weekly_time_limits(user.username, schedule_dict, current_config)
+            if success:
                 user.weekly_schedule.mark_synced()
                 db.session.commit()
+                logger.info("Synced weekly schedule for %s", user.username)
             else:
-                success, message = ssh.set_weekly_time_limits(user.username, schedule_dict)
-                if success:
-                    user.weekly_schedule.mark_synced()
-                    db.session.commit()
-                    logger.info("Synced weekly schedule for %s", user.username)
-                else:
-                    logger.warning("Failed to sync weekly schedule for %s: %s", user.username, message)
-                    self._record_sync_error(user, message)
-                    any_failure = True
+                logger.warning("Failed to sync weekly schedule for %s: %s", user.username, message)
+                self._record_sync_error(user, message)
+                any_failure = True
 
         # --- time intervals ---
         unsynced_intervals = UserDailyTimeInterval.query.filter_by(
             user_id=user.id, is_synced=False
         ).all()
         if unsynced_intervals:
+            # Pass every day's interval (not just the unsynced ones) -- a day
+            # missing from this dict is treated by set_allowed_hours as "no
+            # restriction" (full 24h), which would be wrong for an already-synced
+            # day that genuinely has a restricted interval. The per-day comparison
+            # inside set_allowed_hours against current_config is what actually
+            # limits the write to the day(s) that changed.
             intervals_dict = {iv.day_of_week: iv for iv in user.time_intervals}
-            success, message = ssh.set_allowed_hours(user.username, intervals_dict)
+            success, message = ssh.set_allowed_hours(user.username, intervals_dict, current_config)
             if success:
                 for iv in unsynced_intervals:
                     iv.mark_synced()
@@ -332,6 +452,7 @@ class BackgroundTaskManager:
                         if is_valid and config_dict:
                             user.last_config = json.dumps(config_dict)
                             user.is_valid = True
+                            user.last_read_ok_at = now
                             today = date.today()
                             time_spent = coerce_time_spent_day(config_dict.get('TIME_SPENT_DAY', 0))
                             usage = UserTimeUsage.query.filter_by(
@@ -344,8 +465,35 @@ class BackgroundTaskManager:
                                     UserTimeUsage(user_id=user.id, date=today, time_spent=time_spent)
                                 )
                             logger.info("Updated usage for %s: %ds", user.username, time_spent)
+
+                            # Verify the intended schedule/hours against what the host
+                            # itself just reported -- runs every cycle, independent of
+                            # is_synced, and costs no extra SSH (data already in hand).
+                            ok, detail, limits_drifted, hours_days = self._verify_enforced_config(
+                                user, config_dict
+                            )
+                            if ok:
+                                if user.drift_detail:
+                                    logger.info("Drift cleared for %s@%s",
+                                                user.username, user.system_ip)
+                                user.limits_verified_at = now
+                                user.drift_detail = None
+                                user.drift_since = None
+                                user.drift_repush_at = None
+                            else:
+                                if not user.drift_detail:
+                                    user.drift_since = now
+                                user.drift_detail = detail
+                                logger.error("DRIFT %s@%s: %s", user.username, user.system_ip, detail)
+                                self._schedule_drift_repush(user, now, limits_drifted, hours_days)
                         else:
                             logger.warning("Could not get data for %s: %s", user.username, result_message)
+                            # Don't flip is_valid False here -- the dashboard filters on
+                            # is_valid=True, so that would just hide the group instead of
+                            # surfacing the problem. Recording it as drift keeps it visible.
+                            if not user.drift_detail:
+                                user.drift_since = now
+                            user.drift_detail = f"Host reports: {result_message}"
                         db.session.commit()
                     except Exception as e:
                         logger.error("SSH error reading %s @ %s: %s",
@@ -410,7 +558,10 @@ class BackgroundTaskManager:
                     continue
 
                 limit = group_today_limit(username)
-                if limit <= 0:
+                # None means no schedule configured at all -- nothing to pool-enforce.
+                # 0 is a deliberate "blocked today" and still needs desired=0 pushed
+                # below so an over-limit host gets corrected down to zero.
+                if limit is None:
                     self._last_reconcile[username] = now
                     continue
 

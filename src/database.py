@@ -22,6 +22,56 @@ def coerce_time_spent_day(value):
         return 0
 
 
+def coerce_int(value, default=None):
+    """Best-effort int coercion, tolerating legacy string values from before the
+    ssh_helper parser fix (e.g. '-120' cached in an older last_config blob), lists,
+    None, and bools. Returns *default* rather than raising."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        return coerce_int(value[0], default) if value else default
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+DAY_ORDER = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+
+
+def enforced_limits_from_config(config):
+    """Return {day_num 1-7: seconds} actually enforced by the host, from its
+    ALLOWED_WEEKDAYS/LIMITS_PER_WEEKDAYS (which are positional against each other,
+    not against Monday..Sunday). Days absent from ALLOWED_WEEKDAYS are 0 (blocked).
+
+    Returns None -- never {} -- when the config can't be interpreted, so an
+    unparseable host reply can't be mistaken for "every day blocked".
+    """
+    if not isinstance(config, dict):
+        return None
+    days_raw = config.get('ALLOWED_WEEKDAYS')
+    limits_raw = config.get('LIMITS_PER_WEEKDAYS')
+
+    if days_raw == '' and (limits_raw is None or limits_raw == ''):
+        return {d: 0 for d in range(1, 8)}
+    if not isinstance(days_raw, list) or not isinstance(limits_raw, list):
+        return None
+    if len(days_raw) != len(limits_raw):
+        return None
+
+    pairs = [(coerce_int(d), coerce_int(v)) for d, v in zip(days_raw, limits_raw)]
+    if any(d is None or v is None for d, v in pairs):
+        return None
+
+    result = {d: 0 for d in range(1, 8)}
+    for day_num, seconds in pairs:
+        if 1 <= day_num <= 7:
+            result[day_num] = seconds
+    return result
+
+
 class Settings(db.Model):
     __tablename__ = 'settings'
     id = db.Column(db.Integer, primary_key=True)
@@ -107,7 +157,16 @@ class ManagedUser(db.Model):
     pending_time_operation = db.Column(db.String(1), nullable=True) # + or -
     last_sync_error = db.Column(db.Text, nullable=True) # Message from the last failed push, if any
     last_sync_error_at = db.Column(db.DateTime, nullable=True) # When that failure was recorded
-    
+
+    # Verification: is_synced (above/on the schedule/interval rows) only means
+    # "we sent it"; these columns track whether the host's own reported config
+    # actually matches what was intended. See CLAUDE.md "Data flow".
+    last_read_ok_at = db.Column(db.DateTime, nullable=True)      # last *successful* SSH read
+    limits_verified_at = db.Column(db.DateTime, nullable=True)   # last read that matched the intent
+    drift_detail = db.Column(db.Text, nullable=True)             # human-readable mismatch, or NULL
+    drift_since = db.Column(db.DateTime, nullable=True)          # first observation of current drift
+    drift_repush_at = db.Column(db.DateTime, nullable=True)      # when the one-shot auto-repair fired
+
     # Relationship with usage data and weekly schedules
     usage_data = db.relationship('UserTimeUsage', backref='user', lazy=True, cascade="all, delete-orphan")
     weekly_schedule = db.relationship('UserWeeklySchedule', backref='user', uselist=False, cascade="all, delete-orphan")
@@ -223,6 +282,56 @@ class ManagedUser(db.Model):
         except:
             return None
 
+    def _config_dict(self):
+        if not self.last_config:
+            return None
+        try:
+            return json.loads(self.last_config)
+        except (TypeError, ValueError):
+            return None
+
+    def expected_limits(self):
+        """{day_num 1-7: seconds} this host's weekly schedule is meant to enforce,
+        or None if no schedule row exists for this host at all."""
+        if not self.weekly_schedule:
+            return None
+        schedule_dict = self.weekly_schedule.get_schedule_dict()
+        return {
+            i + 1: int(round((schedule_dict.get(day, 0) or 0) * 3600))
+            for i, day in enumerate(DAY_ORDER)
+        }
+
+    def enforced_limits(self):
+        """{day_num 1-7: seconds} actually enforced according to the last successful
+        read, or None if unreadable/never read."""
+        return enforced_limits_from_config(self._config_dict())
+
+    def enforced_today_seconds(self):
+        """Seconds enforced today according to the host's own reported config."""
+        limits = self.enforced_limits()
+        if limits is None:
+            return None
+        return limits.get(date.today().isoweekday())
+
+    def is_stale(self, max_age=180):
+        """Whether the last successful read is older than *max_age* seconds (or missing)."""
+        if not self.last_read_ok_at:
+            return True
+        return (datetime.utcnow() - self.last_read_ok_at).total_seconds() > max_age
+
+    def verification_state(self):
+        """'drift' | 'unverified' | 'ok' -- single source of truth for the UI.
+
+        'drift': the last read found a mismatch between intent and host config.
+        'unverified': no confirmed-matching read has landed yet, or it's stale.
+        'ok': the host's own config matched the intent as of the last read.
+        """
+        if self.drift_detail:
+            return 'drift'
+        if not self.limits_verified_at or self.is_stale():
+            return 'unverified'
+        return 'ok'
+
 
 class GroupTimeAdjustment(db.Model):
     """Per-day manual pool adjustment for a username group (signed seconds).
@@ -258,25 +367,27 @@ def get_user_groups():
 def group_today_limit(username):
     """Return today's global time limit in seconds for *username* group.
 
-    Returns 0 if no positive time limit is configured for today (unlimited).
-    Includes any GroupTimeAdjustment bonus/penalty recorded for today.
+    Returns None when no member has a weekly schedule configured at all (nothing
+    to enforce, distinct from a deliberate 0 = "blocked today"). Includes any
+    GroupTimeAdjustment bonus/penalty recorded for today.
     """
     today = date.today()
     day_key = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'][today.weekday()]
 
     members = ManagedUser.query.filter_by(username=username).all()
-    base_hours = 0.0
+    base_hours = None
     for m in members:
         if m.weekly_schedule:
-            h = m.weekly_schedule.get_schedule_dict().get(day_key, 0) or 0
-            if h > 0:
-                base_hours = float(h)
-                break
+            # Take the first member that HAS a schedule row, even if its value is
+            # 0 -- skipping it in favour of a sibling host risks showing a stale
+            # or differently-configured host's limit instead of this one's.
+            base_hours = float(m.weekly_schedule.get_schedule_dict().get(day_key, 0) or 0)
+            break
 
-    if base_hours <= 0:
-        return 0
+    if base_hours is None:
+        return None
 
-    base_seconds = int(base_hours * 3600)
+    base_seconds = int(round(base_hours * 3600))
     adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
     extra = adj.extra_seconds if adj else 0
     return max(0, base_seconds + extra)
