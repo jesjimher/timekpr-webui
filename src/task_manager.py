@@ -16,6 +16,7 @@ from src.database import (
     GroupTimeAdjustment,
     get_user_groups,
     group_today_limit,
+    group_spent_today,
     Settings,
 )
 from src.ssh_helper import SSHClient
@@ -538,11 +539,7 @@ class BackgroundTaskManager:
                 continue  # single-host: handled by per-host pending_time_adjustment
 
             try:
-                total_spent = sum(
-                    (UserTimeUsage.query.filter_by(user_id=m.id, date=today).first() or
-                     type('_', (), {'time_spent': 0})()).time_spent
-                    for m in members
-                )
+                total_spent = group_spent_today(username)
 
                 # Check for pending unreconciled pool adjustment — if present, skip
                 # the normal cadence check so the change is applied immediately.
@@ -574,15 +571,34 @@ class BackgroundTaskManager:
                 any_host_reached = False
                 for m in members:
                     try:
-                        current_left = m.get_config_value('TIME_LEFT_DAY')
+                        current_left = coerce_int(m.get_config_value('TIME_LEFT_DAY'))
                         if current_left is None:
                             continue
 
                         any_host_reached = True
 
-                        # Skip the host that is actively consuming time to avoid showing
-                        # a "time changed" notification on the screen the user is using.
-                        if skip_active_host:
+                        delta = desired - current_left
+
+                        # Routine reconciliation only ever cuts time down, never grants it.
+                        # desired is clamped to >= 0 (task_manager.py:568), but current_left
+                        # can be negative once a host goes over budget -- without this check
+                        # that produced a positive delta that restored the host to 0 every
+                        # cycle, so the limit never actually stuck. A successful push patches
+                        # current_left locally (see apply_local_time_left_delta below), so the
+                        # next cycle sees the correction immediately instead of recomputing and
+                        # re-pushing the same delta. Granting time stays reserved for an
+                        # explicit operator adjustment via the pool modal (has_pending_adj).
+                        if delta > 0 and not has_pending_adj:
+                            logger.info("%s@%s: routine reconciliation would grant %ds, skipping "
+                                        "(no pending adjustment)", username, m.system_ip, delta)
+                            self._prev_time_left[m.id] = current_left
+                            continue
+
+                        # Skip the host that is actively consuming time to avoid showing a
+                        # "time changed" notification on the screen the user is using --
+                        # but only for a grant. A cut must always reach the host actually in
+                        # use, since that's the machine the limit is meant to stop.
+                        if skip_active_host and delta > 0:
                             prev_left = self._prev_time_left.get(m.id)
                             if prev_left is not None and current_left < prev_left:
                                 logger.info("%s@%s: skipping active host (left %d→%d)",
@@ -591,7 +607,6 @@ class BackgroundTaskManager:
                                 continue
                         self._prev_time_left[m.id] = current_left
 
-                        delta = desired - current_left
                         if abs(delta) < threshold:
                             logger.info("%s@%s: delta=%ds < threshold=%ds, no adjustment",
                                         username, m.system_ip, delta, threshold)
@@ -614,6 +629,11 @@ class BackgroundTaskManager:
                                 success, msg = ssh.modify_time_left(username, operation, amount)
                             if success:
                                 self._record_success(m.system_ip)
+                                # Reflect the push in last_config immediately so the dashboard
+                                # and the next reconciliation cycle see it without waiting for
+                                # the next 60s --userinfo read.
+                                if m.apply_local_time_left_delta(delta):
+                                    db.session.commit()
                                 logger.info("Reconciliation OK for %s@%s", username, m.system_ip)
                             else:
                                 logger.warning("Reconciliation failed for %s@%s: %s",

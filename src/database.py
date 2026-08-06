@@ -313,6 +313,21 @@ class ManagedUser(db.Model):
             return None
         return limits.get(date.today().isoweekday())
 
+    def apply_local_time_left_delta(self, delta):
+        """Optimistically reflect a just-applied settimeleft delta in last_config,
+        so other readers (dashboard, the next reconciliation pass) see it without
+        waiting for the next --userinfo read to land. Returns True if last_config
+        was updated, False if it couldn't be parsed (caller should then treat
+        get_config_value('TIME_LEFT_DAY') as stale until the next real read).
+        """
+        config = self._config_dict()
+        if config is None:
+            return False
+        current = coerce_int(config.get('TIME_LEFT_DAY'), default=0)
+        config['TIME_LEFT_DAY'] = current + delta
+        self.last_config = json.dumps(config)
+        return True
+
     def is_stale(self, max_age=180):
         """Whether the last successful read is older than *max_age* seconds (or missing)."""
         if not self.last_read_ok_at:
@@ -391,6 +406,33 @@ def group_today_limit(username):
     adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
     extra = adj.extra_seconds if adj else 0
     return max(0, base_seconds + extra)
+
+
+def group_spent_today(username):
+    """Return total seconds spent today across every member of *username* group."""
+    today = date.today()
+    members = ManagedUser.query.filter_by(username=username).all()
+    return sum(
+        (usage.time_spent if (usage := UserTimeUsage.query.filter_by(user_id=m.id, date=today).first()) else 0)
+        for m in members
+    )
+
+
+def pool_exhaustion_seconds(member, pool_remaining, tolerance=60):
+    """TIME_LEFT_DAY the host still reports when it shouldn't have any left,
+    because the group's shared pool is exhausted -- or None if not applicable.
+
+    Distinct from verification_state(), which only compares configured vs.
+    enforced *limits* for a single host, never the group's shared pool total;
+    that combination (pool at zero, host still positive) is what a stuck or
+    not-yet-landed reconciliation push looks like.
+    """
+    if pool_remaining != 0:
+        return None
+    left = coerce_int(member.get_config_value('TIME_LEFT_DAY'))
+    if left is None or left <= tolerance:
+        return None
+    return left
 
 
 class UserTimeUsage(db.Model):

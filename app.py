@@ -16,6 +16,8 @@ from src.database import (
     coerce_int,
     GroupTimeAdjustment,
     group_today_limit,
+    group_spent_today,
+    pool_exhaustion_seconds,
 )
 from src.ssh_helper import SSHClient
 from src.task_manager import BackgroundTaskManager
@@ -167,11 +169,7 @@ def dashboard():
         # segment only). This is what the app *intends*, not what's enforced --
         # see the ground-truth block below for what the hosts actually report.
         limit_seconds = group_today_limit(username)
-        total_spent_today = sum(
-            (UserTimeUsage.query.filter_by(user_id=m.id, date=today).first() or
-             type('_', (), {'time_spent': 0})()).time_spent
-            for m in members
-        )
+        total_spent_today = group_spent_today(username)
         if limit_seconds is not None:
             pool_remaining_seconds = max(0, limit_seconds - total_spent_today)
             remaining_today_hours = pool_remaining_seconds / 3600.0
@@ -223,6 +221,20 @@ def dashboard():
         else:
             verification = 'ok'
         drift_details = [f"{m.system_ip}: {m.drift_detail}" for m in members if m.drift_detail]
+
+        # --- Pool-exhaustion backstop: the schedule/hours drift check above only
+        # compares configured vs. enforced *limits*, so a host that still reports
+        # positive TIME_LEFT_DAY while the shared pool is at zero wouldn't show up
+        # there -- that combination is exactly what a stuck/failed reconciliation
+        # looks like (see task_manager._reconcile_groups). Flag it as drift too, no
+        # extra SSH needed since it reuses the same reads already fetched above.
+        for m in fresh_members:
+            left = pool_exhaustion_seconds(m, pool_remaining_seconds)
+            if left is not None:
+                verification = 'drift'
+                drift_details.append(
+                    f"{m.system_ip}: pool exhausted but host reports {_format_hm(left)} left"
+                )
 
         # --- Pending pool adjustment flag ---
         pool_adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
@@ -884,6 +896,22 @@ def get_schedule_sync_status(user_id):
         )
         configured_today = int(round((configured_today or 0) * 3600))
 
+    # Pool-exhaustion backstop, same signal as the dashboard route: a host that
+    # still reports positive TIME_LEFT_DAY while the group's shared pool is at
+    # zero means a reconciliation push didn't stick (or hasn't landed yet).
+    # This is what keeps the dashboard alarm banner alive across the 5s polling
+    # cycle instead of it only showing on the initial page render.
+    verification_state = user.verification_state()
+    drift_detail = user.drift_detail
+    if verification_state != 'drift' and not offline and not user.is_stale():
+        pool_limit = group_today_limit(user.username)
+        if pool_limit is not None:
+            pool_remaining = max(0, pool_limit - group_spent_today(user.username))
+            left = pool_exhaustion_seconds(user, pool_remaining)
+            if left is not None:
+                verification_state = 'drift'
+                drift_detail = f"pool exhausted but host reports {_format_hm(left)} left"
+
     payload = {
         'success': True,
         'system_ip': user.system_ip,
@@ -891,8 +919,8 @@ def get_schedule_sync_status(user_id):
         'intervals_synced': intervals_synced,
         'last_sync_error': user.last_sync_error,
         'last_sync_error_at': last_sync_error_at,
-        'verification_state': user.verification_state(),
-        'drift_detail': user.drift_detail,
+        'verification_state': verification_state,
+        'drift_detail': drift_detail,
         'drift_since': user.drift_since.strftime('%Y-%m-%d %H:%M') if user.drift_since else None,
         'limits_verified_at': user.limits_verified_at.strftime('%Y-%m-%d %H:%M') if user.limits_verified_at else None,
         'last_read_ok_at_iso': user.last_read_ok_at.isoformat() + 'Z' if user.last_read_ok_at else None,
