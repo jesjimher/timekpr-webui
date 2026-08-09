@@ -89,26 +89,9 @@ class BackgroundTaskManager:
                 logger.info("Thread stopped successfully")
         logger.info("Background task manager stopped")
 
-    def restart(self):
-        logger.info("Restarting background task manager...")
-        self.stop()
-        time.sleep(1)
-        self.start()
-        logger.info("Background task manager restarted")
-
     def trigger_sync(self):
         """Wake the background loop immediately to push pending changes."""
         self._sync_event.set()
-
-    def get_status(self):
-        status = {
-            'running': self.running,
-            'thread_alive': self.thread.is_alive() if self.thread else False,
-            'last_error': self.last_error,
-            'thread_id': self.thread.ident if self.thread else None,
-        }
-        logger.info("Task manager status: %s", status)
-        return status
 
     # ------------------------------------------------------------------ backoff
 

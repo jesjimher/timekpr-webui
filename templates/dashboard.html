@@ -16,16 +16,7 @@
                 <p class="dashboard-subtitle">Parental Control Management</p>
             </div>
             <div class="dashboard-controls">
-                <div class="task-status-container" id="task-status-container" style="display: none;">
-                    <span class="status-indicator" id="task-status-indicator">Unknown</span>
-                    <a href="{{ url_for('restart_tasks') }}" class="btn btn-sm btn-secondary btn-icon" title="Restart Sync Loop">
-                        <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
-                            <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
-                            <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
-                        </svg>
-                    </a>
-                </div>
-                <a href="{{ url_for('admin') }}" class="btn btn-sm btn-secondary">Management</a>
+<a href="{{ url_for('admin') }}" class="btn btn-sm btn-secondary">Management</a>
                 <a href="{{ url_for('settings') }}" class="btn btn-sm btn-secondary">Settings</a>
                 <a href="{{ url_for('logout') }}" class="btn btn-sm btn-danger">Logout</a>
             </div>
@@ -46,8 +37,6 @@
                     .then(r => r.json())
                     .then(data => {
                         if (!data.success) return;
-
-                        updateTaskStatus(data.sync);
 
                         let anyAlarm = false;
                         const banner = document.getElementById('alarm-banner');
@@ -129,27 +118,6 @@
                         }
                     })
                     .catch(() => {});
-            }
-
-            function updateTaskStatus(status) {
-                const container = document.getElementById('task-status-container');
-                const indicator = document.getElementById('task-status-indicator');
-                const hasIssues = !status.running || !status.thread_alive || status.last_error;
-                if (hasIssues) {
-                    container.style.display = 'flex';
-                    if (status.running && status.thread_alive) {
-                        indicator.className = 'status-active';
-                        indicator.textContent = 'Active';
-                    } else {
-                        indicator.className = 'status-inactive';
-                        indicator.textContent = 'Inactive';
-                    }
-                    indicator.title = status.last_error
-                        ? `Last error: ${status.last_error.message} at ${status.last_error.time}`
-                        : 'Sync loop is running normally';
-                } else {
-                    container.style.display = 'none';
-                }
             }
 
             function relativeSyncText(isoString) {

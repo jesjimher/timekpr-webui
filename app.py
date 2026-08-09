@@ -495,15 +495,8 @@ def api_status():
             },
         }
 
-    return jsonify({'success': True, 'sync': sync_manager.get_status(), 'users': users_payload})
+    return jsonify({'success': True, 'users': users_payload})
 
-
-@app.route('/restart-tasks')
-@login_required
-def restart_tasks():
-    sync_manager.restart()
-    flash('Sync loop restarted', 'success')
-    return redirect(request.referrer or url_for('dashboard'))
 
 
 # ---------------------------------------------------------------- settings
