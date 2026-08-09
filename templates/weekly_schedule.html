@@ -80,8 +80,8 @@
             border-bottom: 2px solid var(--border-primary);
             padding: var(--space-1) var(--space-4);
             display: grid;
-            grid-template-columns: 100px minmax(200px, 240px) 1fr;
-            gap: var(--space-3);
+            grid-template-columns: 100px auto 1fr;
+            gap: var(--space-12);
             align-items: center;
             font-weight: 600;
             color: var(--text-primary);
@@ -90,8 +90,8 @@
         .schedule-row {
             padding: var(--space-1) var(--space-4);
             display: grid;
-            grid-template-columns: 100px minmax(200px, 240px) 1fr;
-            gap: var(--space-3);
+            grid-template-columns: 100px auto 1fr;
+            gap: var(--space-12);
             align-items: center;
             border-bottom: 1px solid var(--border-primary);
             transition: background-color var(--transition-fast);
@@ -166,6 +166,7 @@
             background: var(--bg-elevated);
             color: var(--text-primary);
             font-size: var(--font-size-sm);
+            font-family: inherit;
             cursor: pointer;
         }
         .time-input-clock:disabled { opacity: 0.5; cursor: not-allowed; }
