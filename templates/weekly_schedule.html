@@ -159,6 +159,19 @@
         }
         .time-select:disabled { opacity: 0.5; cursor: not-allowed; }
 
+        .time-input-clock {
+            padding: var(--space-1) var(--space-2);
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius-sm);
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            font-size: var(--font-size-sm);
+            cursor: pointer;
+        }
+        .time-input-clock:disabled { opacity: 0.5; cursor: not-allowed; }
+        [data-theme="dark"]  .time-input-clock { color-scheme: dark; }
+        [data-theme="light"] .time-input-clock { color-scheme: light; }
+
         .actions-section {
             padding: var(--space-6);
             background: var(--bg-elevated);
@@ -183,12 +196,12 @@
             .time-controls .time-input { flex: 1; width: auto; min-width: 0; max-width: 140px; }
             .interval-controls { flex-wrap: wrap; justify-content: space-between; width: 100%; gap: var(--space-2); }
             .interval-time { flex: 1; justify-content: flex-end; }
-            .interval-time .time-select { flex: 1; min-width: 0; max-width: 120px; }
+            .interval-time .time-input-clock { flex: 1; min-width: 0; max-width: 120px; }
             .schedule-controls { flex-direction: column; }
             .quick-control { flex-wrap: wrap; gap: var(--space-3); }
             .quick-label { width: 100%; font-size: var(--font-size-sm); font-weight: 600; }
             .quick-stepper { width: 100%; justify-content: center; }
-            .quick-stepper .time-select { flex: 1; min-width: 0; }
+            .quick-stepper .time-input-clock { flex: 1; min-width: 0; }
             .quick-actions { width: 100%; justify-content: space-between; }
         }
     </style>
@@ -268,18 +281,9 @@
                 <div class="quick-control">
                     <span class="quick-label">Quick set interval:</span>
                     <div class="quick-stepper">
-                        <select id="bulk-start" class="time-select">
-                            {% for h in range(24) %}
-                            <option value="{{ h }}" {% if h == 9 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                            {% endfor %}
-                        </select>
+                        <input type="time" id="bulk-start" class="time-input-clock" value="09:00">
                         <span>to</span>
-                        <select id="bulk-end" class="time-select">
-                            {% for h in range(1, 24) %}
-                            <option value="{{ h }}" {% if h == 17 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                            {% endfor %}
-                            <option value="24">23:59</option>
-                        </select>
+                        <input type="time" id="bulk-end" class="time-input-clock" value="17:00">
                     </div>
                     <div class="quick-actions">
                         <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdayIntervals()">Weekdays</button>
@@ -331,18 +335,19 @@
                                     <label for="interval-{{ day_num }}">Enable</label>
                                 </div>
                                 <div class="interval-time">
-                                    <select id="start-{{ day_num }}" name="start_hour_{{ day_num }}" class="time-select" {% if not dl.hours_enabled %}disabled{% endif %}>
-                                        {% for h in range(24) %}
-                                        <option value="{{ h }}" {% if h == dl.start_hour %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                                        {% endfor %}
-                                    </select>
+                                    <input type="time"
+                                           id="start-{{ day_num }}"
+                                           name="start_time_{{ day_num }}"
+                                           class="time-input-clock"
+                                           value="{{ '%02d:%02d'|format(dl.start_hour, dl.start_minute) }}"
+                                           {% if not dl.hours_enabled %}disabled{% endif %}>
                                     <span>to</span>
-                                    <select id="end-{{ day_num }}" name="end_hour_{{ day_num }}" class="time-select" {% if not dl.hours_enabled %}disabled{% endif %}>
-                                        {% for h in range(1, 24) %}
-                                        <option value="{{ h }}" {% if h == dl.end_hour %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                                        {% endfor %}
-                                        <option value="24" {% if dl.end_hour >= 24 %}selected{% endif %}>23:59</option>
-                                    </select>
+                                    <input type="time"
+                                           id="end-{{ day_num }}"
+                                           name="end_time_{{ day_num }}"
+                                           class="time-input-clock"
+                                           value="{{ '%02d:%02d'|format(dl.end_hour, dl.end_minute) }}"
+                                           {% if not dl.hours_enabled %}disabled{% endif %}>
                                 </div>
                             </div>
                         </div>

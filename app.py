@@ -359,16 +359,17 @@ def update_weekly_schedule():
             hours = 0.0
         dl.limit_seconds = int(round(hours * 3600))
         dl.hours_enabled = request.form.get(f'hours_enabled_{day}') == 'on'
-        # Hour-only picker (no minute UI): end_hour may be 24 ("23:59" in the
-        # select), which hour_tokens()'s range(start, end) already turns into
-        # hours 0..23 correctly -- no need for the old 23h59m conversion.
         try:
-            dl.start_hour = int(request.form.get(f'start_hour_{day}', dl.start_hour))
-            dl.end_hour = int(request.form.get(f'end_hour_{day}', dl.end_hour))
+            start_time = request.form.get(f'start_time_{day}', '')
+            end_time   = request.form.get(f'end_time_{day}', '')
+            if start_time:
+                sh, sm = (int(x) for x in start_time.split(':'))
+                dl.start_hour, dl.start_minute = sh, sm
+            if end_time:
+                eh, em = (int(x) for x in end_time.split(':'))
+                dl.end_hour, dl.end_minute = eh, em
         except (TypeError, ValueError):
             pass
-        dl.start_minute = 0
-        dl.end_minute = 0
         if dl.hours_enabled and not dl.is_valid_interval():
             db.session.rollback()
             flash(f'Invalid time interval for {dl.day_name()}: start time must be before end time', 'danger')
