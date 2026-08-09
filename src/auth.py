@@ -1,5 +1,5 @@
 from flask import session, request
-from src.database import db, Settings, ManagedUser
+from src.models import db, Settings
 
 
 def get_auth_mode():

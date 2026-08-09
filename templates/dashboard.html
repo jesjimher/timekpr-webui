@@ -18,7 +18,7 @@
             <div class="dashboard-controls">
                 <div class="task-status-container" id="task-status-container" style="display: none;">
                     <span class="status-indicator" id="task-status-indicator">Unknown</span>
-                    <a href="{{ url_for('restart_tasks') }}" class="btn btn-sm btn-secondary btn-icon" title="Restart Background Tasks">
+                    <a href="{{ url_for('restart_tasks') }}" class="btn btn-sm btn-secondary btn-icon" title="Restart Sync Loop">
                         <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
                             <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
                             <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
@@ -32,197 +32,135 @@
         </header>
 
         <script>
-            function updateTaskStatus() {
-                fetch('/api/task-status')
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            const container = document.getElementById('task-status-container');
-                            const indicator = document.getElementById('task-status-indicator');
-                            const status = data.status;
-                            const hasIssues = !status.running || !status.thread_alive || status.last_error;
-                            if (hasIssues) {
-                                container.style.display = 'flex';
-                                if (status.running && status.thread_alive) {
-                                    indicator.className = 'status-active';
-                                    indicator.textContent = 'Active';
-                                } else {
-                                    indicator.className = 'status-inactive';
-                                    indicator.textContent = 'Inactive';
-                                }
-                                indicator.title = status.last_error
-                                    ? `Last error: ${status.last_error.message} at ${status.last_error.time}`
-                                    : 'Background tasks are running normally';
-                            } else {
-                                container.style.display = 'none';
-                            }
-                        }
-                    })
-                    .catch(() => {
-                        const container = document.getElementById('task-status-container');
-                        const indicator = document.getElementById('task-status-indicator');
-                        container.style.display = 'flex';
-                        indicator.className = 'status-error';
-                        indicator.textContent = 'Error';
-                    });
+            const warnIconPath = 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z';
+
+            // Everything the dashboard needs to stay live comes from a single
+            // endpoint -- host status, verification state, time-left headline,
+            // pool remaining. All DB reads server-side, no extra host traffic.
+            const GROUP_INDEX = {{ groups | map(attribute='username') | list | tojson }};
+
+            function fmtHM(s) {
+                return `${Math.floor(Math.max(0, s) / 3600)}h ${Math.floor((Math.max(0, s) % 3600) / 60)}m`;
             }
 
-            // Poll sync/verification status for every group; update its badge, the
-            // top alarm banner, and the "Time Left Today" headline from ground
-            // truth. All-DB-read on the server side -- no extra host traffic.
-            function updateSyncStatus() {
-                {% for group in groups %}
-                {
-                    const hostIds = {{ group.ids | tojson }};
-                    const groupIdx = {{ loop.index0 }};
-                    const groupUsername = {{ group.username | tojson }};
-                    Promise.all(
-                        hostIds.map(id => fetch('/api/schedule-sync-status/' + id).then(r => r.json()))
-                    ).then(results => {
-                        const ok = results.filter(d => d.success);
-
-                        // Worst verification state across this group's hosts.
-                        let worst = 'ok';
-                        if (ok.some(d => d.verification_state === 'drift')) worst = 'drift';
-                        else if (ok.some(d => d.verification_state === 'unverified')) worst = 'unverified';
-
-                        // A host is "pending" if its schedule hasn't synced yet, or its
-                        // allowed-hours intervals haven't -- independent of verification.
-                        const pending = ok.filter(d => (d.schedule && !d.is_synced) || !d.intervals_synced);
-
-                        const badge    = document.getElementById('sync-status-' + groupIdx);
-                        const syncText = document.getElementById('sync-text-' + groupIdx);
-                        const syncIcon = document.getElementById('sync-icon-' + groupIdx);
-                        const warnIconPath = 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z';
-
-                        if (badge) {
-                            if (worst === 'drift' || worst === 'unverified') {
-                                badge.className = 'badge badge-danger sync-status-badge';
-                                badge.style.display = 'block';
-                                if (worst === 'drift') {
-                                    const drifted = ok.filter(d => d.verification_state === 'drift');
-                                    syncText.textContent = 'NOT ENFORCED';
-                                    badge.title = drifted.map(d => `${d.system_ip}: ${d.drift_detail}`).join('\n');
-                                } else {
-                                    syncText.textContent = 'Limit unverified';
-                                    badge.title = ok.filter(d => d.verification_state === 'unverified')
-                                        .map(d => `${d.system_ip}: ${d.offline ? 'offline' : 'not yet verified'}`)
-                                        .join('\n');
-                                }
-                                syncIcon.setAttribute('d', warnIconPath);
-                            } else if (pending.length > 0) {
-                                const reasons = pending.map(d => {
-                                    if (d.offline) return `Waiting for ${d.system_ip} (offline)`;
-                                    if (d.last_sync_error) return `Sync failed on ${d.system_ip}`;
-                                    return `Syncing ${d.system_ip}…`;
-                                });
-                                const errors = pending.filter(d => d.last_sync_error);
-                                badge.className = 'badge badge-warning sync-status-badge';
-                                badge.style.display = 'block';
-                                badge.title = errors.length
-                                    ? errors.map(d => `${d.system_ip}: ${d.last_sync_error}`).join('\n')
-                                    : '';
-                                syncText.textContent = reasons.join(' · ');
-                                syncIcon.setAttribute('d', warnIconPath);
-                            } else {
-                                badge.style.display = 'none';
-                            }
-                        }
-
-                        // Refresh "Time Left Today" from ground truth (max TIME_LEFT_DAY
-                        // across non-stale hosts) so the headline stays live instead of
-                        // frozen at page render.
-                        const fresh = ok.filter(d => !d.stale && d.time_left_day !== null && d.time_left_day !== undefined);
-                        const timeLeftEl = document.getElementById('time-left-' + groupIdx);
-                        const fmtHM = s => `${Math.floor(Math.max(0, s) / 3600)}h ${Math.floor((Math.max(0, s) % 3600) / 60)}m`;
-                        if (timeLeftEl) {
-                            timeLeftEl.textContent = fresh.length > 0
-                                ? fmtHM(Math.max(...fresh.map(d => d.time_left_day)))
-                                : 'Unknown';
-                            timeLeftEl.classList.toggle('stat-value-danger', worst === 'drift' || worst === 'unverified');
-                        }
-
-                        const mismatchEl = document.getElementById('limit-mismatch-' + groupIdx);
-                        const withLimits = ok.filter(d => d.enforced_today_seconds != null && d.configured_today_seconds != null);
-                        if (mismatchEl && withLimits.length > 0) {
-                            const enforced = Math.max(...withLimits.map(d => d.enforced_today_seconds));
-                            const configured = withLimits[0].configured_today_seconds;
-                            if (Math.abs(enforced - configured) > 60) {
-                                const configuredStr = configured === 0 ? 'blocked' : fmtHM(configured);
-                                mismatchEl.textContent = `Host limit today: ${fmtHM(enforced)} — configured ${configuredStr}`;
-                                mismatchEl.style.display = '';
-                            } else {
-                                mismatchEl.style.display = 'none';
-                            }
-                        }
-
-                        // Reflect this group's state in the top alarm banner and the
-                        // page title, without requiring a full reload.
-                        const banner = document.getElementById('alarm-banner');
-                        const list = document.getElementById('alarm-banner-list');
-                        let item = list ? list.querySelector('[data-alarm-group="' + groupIdx + '"]') : null;
-                        if (worst === 'drift' || worst === 'unverified') {
-                            const text = worst === 'drift'
-                                ? 'NOT ENFORCED' + (badge && badge.title ? ': ' + badge.title.replace(/\n/g, '; ') : '')
-                                : 'limit unverified (host unreachable or never read)';
-                            if (!item && list) {
-                                item = document.createElement('li');
-                                item.dataset.alarmGroup = String(groupIdx);
-                                list.appendChild(item);
-                            }
-                            if (item) item.textContent = `${groupUsername} — ${text}`;
-                        } else if (item) {
-                            item.remove();
-                        }
-                        if (banner && list) {
-                            const stillAlarming = list.children.length > 0;
-                            banner.style.display = stillAlarming ? 'block' : 'none';
-                            const base = document.title.replace(/^\(!\) /, '');
-                            document.title = stillAlarming ? `(!) ${base}` : base;
-                        }
-                    }).catch(() => {});
-                }
-                {% endfor %}
-            }
-
-            function updateHostStatus() {
-                fetch('/api/host-status')
+            function updateStatus() {
+                fetch('/api/status')
                     .then(r => r.json())
                     .then(data => {
                         if (!data.success) return;
-                        const offlineSet = new Set(data.offline_ips);
-                        const inUseSet = new Set((data.in_use_ids || []).map(String));
-                        document.querySelectorAll('.host-entry').forEach(el => {
-                            const ip = el.dataset.hostIp;
-                            const badge = el.querySelector('.host-status-dot');
-                            if (!badge) return;
-                            if (offlineSet.has(ip)) {
-                                badge.classList.add('offline');
-                                badge.title = 'This computer is offline';
-                            } else {
-                                badge.classList.remove('offline');
-                                badge.title = 'This computer is online';
+
+                        updateTaskStatus(data.sync);
+
+                        let anyAlarm = false;
+                        const banner = document.getElementById('alarm-banner');
+                        const list = document.getElementById('alarm-banner-list');
+
+                        GROUP_INDEX.forEach((username, groupIdx) => {
+                            const info = data.users[username];
+                            if (!info) return;
+
+                            // Host dots + "(in use)" labels for this group.
+                            document.querySelectorAll('.host-entry[data-group="' + groupIdx + '"]').forEach(el => {
+                                const acct = info.accounts[el.dataset.hostId];
+                                if (!acct) return;
+                                const dot = el.querySelector('.host-status-dot');
+                                if (dot) {
+                                    dot.classList.toggle('offline', acct.offline);
+                                    dot.title = acct.offline ? 'This computer is offline' : 'This computer is online';
+                                }
+                                const nameEl = el.querySelector('.host-entry-name');
+                                let label = nameEl ? nameEl.querySelector('.in-use-label') : null;
+                                if (acct.in_use && !label && nameEl) {
+                                    label = document.createElement('span');
+                                    label.className = 'in-use-label';
+                                    label.textContent = '(in use)';
+                                    nameEl.appendChild(document.createTextNode(' '));
+                                    nameEl.appendChild(label);
+                                } else if (!acct.in_use && label) {
+                                    const prev = label.previousSibling;
+                                    if (prev && prev.nodeType === Node.TEXT_NODE && prev.textContent === ' ') prev.remove();
+                                    label.remove();
+                                }
+                                const syncedEl = el.querySelector('.host-synced');
+                                if (syncedEl && acct.last_synced_iso) {
+                                    syncedEl.dataset.syncedUtc = acct.last_synced_iso;
+                                }
+                            });
+
+                            // Verification badge + alarm state.
+                            const worst = info.verification;
+                            const badge = document.getElementById('sync-status-' + groupIdx);
+                            const syncText = document.getElementById('sync-text-' + groupIdx);
+                            const syncIcon = document.getElementById('sync-icon-' + groupIdx);
+                            if (badge) {
+                                if (worst === 'drift' || worst === 'unverified') {
+                                    badge.className = 'badge badge-danger sync-status-badge';
+                                    badge.style.display = 'block';
+                                    badge.title = info.drift_details.join('\n');
+                                    syncText.textContent = worst === 'drift' ? 'NOT ENFORCED' : 'Limit unverified';
+                                    syncIcon.setAttribute('d', warnIconPath);
+                                } else {
+                                    badge.style.display = 'none';
+                                }
                             }
 
-                            const nameEl = el.querySelector('.host-entry-name');
-                            let label = nameEl ? nameEl.querySelector('.in-use-label') : null;
-                            const shouldBeInUse = inUseSet.has(el.dataset.hostId);
-                            if (shouldBeInUse && !label && nameEl) {
-                                label = document.createElement('span');
-                                label.className = 'in-use-label';
-                                label.textContent = '(in use)';
-                                nameEl.appendChild(document.createTextNode(' '));
-                                nameEl.appendChild(label);
-                            } else if (!shouldBeInUse && label) {
-                                const prev = label.previousSibling;
-                                if (prev && prev.nodeType === Node.TEXT_NODE && prev.textContent === ' ') {
-                                    prev.remove();
+                            // "Time Left Today" + pool sub-line, refreshed from ground truth.
+                            const timeLeftEl = document.getElementById('time-left-' + groupIdx);
+                            if (timeLeftEl) {
+                                timeLeftEl.textContent = info.time_left_str;
+                                timeLeftEl.classList.toggle('stat-value-danger', worst === 'drift' || worst === 'unverified');
+                            }
+                            const poolEl = document.getElementById('pool-remaining-' + groupIdx);
+                            if (poolEl && info.pool_remaining_str) {
+                                poolEl.textContent = 'Budget left (pool): ' + info.pool_remaining_str;
+                            }
+
+                            if (worst === 'drift' || worst === 'unverified') {
+                                anyAlarm = true;
+                                let item = list ? list.querySelector('[data-alarm-group="' + groupIdx + '"]') : null;
+                                const text = worst === 'drift'
+                                    ? 'NOT ENFORCED' + (info.drift_details.length ? ': ' + info.drift_details.join('; ') : '')
+                                    : 'limit unverified (host unreachable or never read)';
+                                if (!item && list) {
+                                    item = document.createElement('li');
+                                    item.dataset.alarmGroup = String(groupIdx);
+                                    list.appendChild(item);
                                 }
-                                label.remove();
+                                if (item) item.textContent = `${username} — ${text}`;
+                            } else if (list) {
+                                const item = list.querySelector('[data-alarm-group="' + groupIdx + '"]');
+                                if (item) item.remove();
                             }
                         });
+
+                        if (banner) {
+                            banner.style.display = anyAlarm ? 'block' : 'none';
+                            const base = document.title.replace(/^\(!\) /, '');
+                            document.title = anyAlarm ? `(!) ${base}` : base;
+                        }
                     })
                     .catch(() => {});
+            }
+
+            function updateTaskStatus(status) {
+                const container = document.getElementById('task-status-container');
+                const indicator = document.getElementById('task-status-indicator');
+                const hasIssues = !status.running || !status.thread_alive || status.last_error;
+                if (hasIssues) {
+                    container.style.display = 'flex';
+                    if (status.running && status.thread_alive) {
+                        indicator.className = 'status-active';
+                        indicator.textContent = 'Active';
+                    } else {
+                        indicator.className = 'status-inactive';
+                        indicator.textContent = 'Inactive';
+                    }
+                    indicator.title = status.last_error
+                        ? `Last error: ${status.last_error.message} at ${status.last_error.time}`
+                        : 'Sync loop is running normally';
+                } else {
+                    container.style.display = 'none';
+                }
             }
 
             function relativeSyncText(isoString) {
@@ -231,7 +169,6 @@
                 const diffSec = Math.floor((now - then) / 1000);
 
                 if (diffSec < 60) return 'just now';
-
                 const diffMin = Math.floor(diffSec / 60);
                 if (diffMin < 60) return diffMin + ' min ago';
 
@@ -254,17 +191,11 @@
                 });
             }
 
-            // The elements these touch are rendered further down in the page, so run the
-            // initial pass once the DOM has finished parsing rather than immediately here.
             document.addEventListener('DOMContentLoaded', function() {
-                updateTaskStatus();
-                updateSyncStatus();
-                updateHostStatus();
+                updateStatus();
                 refreshSyncLabels();
             });
-            setInterval(updateTaskStatus, 30000);
-            setInterval(updateSyncStatus, 5000);
-            setInterval(updateHostStatus, 5000);
+            setInterval(updateStatus, 5000);
             setInterval(refreshSyncLabels, 30000);
         </script>
 
@@ -301,7 +232,7 @@
                                 <h2 class="user-name">{{ group.username }}</h2>
                                 <div class="user-location">
                                     {%- for host in group.hosts -%}
-                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="{% if host.last_read_ok_at %}{{ (host.last_read_ok_at|localtime).strftime('%d/%m/%Y %H:%M') }}{% else %}Last successful read{% endif %}" data-sync-prefix="synced "{% if host.last_read_ok_at %} data-synced-utc="{{ host.last_read_ok_at.isoformat() }}Z"{% endif %}>{% if host.last_read_ok_at %}synced {{ host.last_read_ok_at|synctime }}{% else %}never synced{% endif %}</span></span>
+                                        <span class="host-entry" data-host-ip="{{ host.ip }}" data-host-id="{{ host.id }}" data-group="{{ loop.index0 }}"><span class="host-entry-name"><span class="host-status-dot{{ ' offline' if host.offline else '' }}" title="{{ 'This computer is offline' if host.offline else 'This computer is online' }}"></span>{{ host.ip }}{% if host.in_use %} <span class="in-use-label">(in use)</span>{% endif %}</span><span class="host-synced" title="{% if host.last_synced %}{{ (host.last_synced|localtime).strftime('%d/%m/%Y %H:%M') }}{% else %}Last successful read{% endif %}" data-sync-prefix="synced "{% if host.last_synced %} data-synced-utc="{{ host.last_synced.isoformat() }}Z"{% endif %}>{% if host.last_synced %}synced {{ host.last_synced|synctime }}{% else %}never synced{% endif %}</span></span>
                                     {%- endfor -%}
                                 </div>
                             </div>
@@ -313,12 +244,12 @@
                                     <div class="stat-value{{ ' stat-value-danger' if group.verification in ('drift', 'unverified') else '' }}"
                                          id="time-left-{{ loop.index0 }}">{{ group.global_time_left }}</div>
                                     {% if group.show_limit_mismatch %}
-                                    <div class="stat-sub stat-sub-danger" id="limit-mismatch-{{ loop.index0 }}">
+                                    <div class="stat-sub stat-sub-danger">
                                         Host limit today: {{ group.enforced_limit_today_str }} — configured {{ group.configured_limit_today_str }}
                                     </div>
                                     {% endif %}
                                     {% if group.is_multi_host and group.pool_remaining_str %}
-                                    <div class="stat-sub">Budget left (pool): {{ group.pool_remaining_str }}</div>
+                                    <div class="stat-sub" id="pool-remaining-{{ loop.index0 }}">Budget left (pool): {{ group.pool_remaining_str }}</div>
                                     {% endif %}
                                 </div>
                                 <div class="stat-item">
@@ -333,19 +264,18 @@
                                 </div>
                             </div>
 
-                            {% if group.has_pending %}
+                            {% if group.has_bonus %}
                             <div class="badge badge-warning" style="margin-bottom: var(--space-4);">
                                 <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                     <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
                                 </svg>
-                                Pending time adjustment
+                                Time adjustment active today
                             </div>
                             {% endif %}
 
-                            {% set _needs_badge = group.verification in ('drift', 'unverified') or group.any_unsynced %}
                             <div id="sync-status-{{ loop.index0 }}"
-                                 class="badge sync-status-badge {{ 'badge-danger' if group.verification in ('drift', 'unverified') else 'badge-warning' }}"
-                                 style="margin-bottom: var(--space-4); display: {{ 'block' if _needs_badge else 'none' }};"
+                                 class="badge sync-status-badge badge-danger"
+                                 style="margin-bottom: var(--space-4); display: {{ 'block' if group.verification in ('drift', 'unverified') else 'none' }};"
                                  {% if group.drift_details %}title="{{ group.drift_details | join('&#10;') }}"{% endif %}>
                                 <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                     <path id="sync-icon-{{ loop.index0 }}" d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
@@ -353,10 +283,8 @@
                                 <span id="sync-text-{{ loop.index0 }}">
                                     {%- if group.verification == 'drift' -%}
                                         NOT ENFORCED
-                                    {%- elif group.verification == 'unverified' -%}
-                                        Limit unverified{% if group.last_checked %} since {{ group.last_checked|synctime }}{% endif %}
                                     {%- else -%}
-                                        Schedule Not Synced
+                                        Limit unverified{% if group.last_checked %} since {{ group.last_checked|synctime }}{% endif %}
                                     {%- endif -%}
                                 </span>
                             </div>
@@ -366,9 +294,9 @@
                                         onclick="openTimeAdjustModal('{{ group.username | e }}')">
                                     Adjust Time
                                 </button>
-                                <a href="{{ url_for('weekly_schedule_group', username=group.username) }}"
+                                <a href="{{ url_for('weekly_schedule', username=group.username) }}"
                                    class="btn btn-secondary">Schedule</a>
-                                <a href="{{ url_for('group_stats', username=group.username) }}"
+                                <a href="{{ url_for('user_stats', username=group.username) }}"
                                    class="btn btn-secondary">History</a>
                             </div>
                         </div>
@@ -414,7 +342,6 @@
         const todayStr = new Date().toISOString().slice(0, 10);
         const shortWeekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-        // Colour palette for host datasets (up to 6 hosts)
         const PALETTE = [
             { bg: 'rgb(59 130 246 / 0.7)',  border: 'rgb(59 130 246)' },
             { bg: 'rgb(16 185 129 / 0.7)',  border: 'rgb(16 185 129)' },
@@ -424,7 +351,6 @@
             { bg: 'rgb(236 72 153 / 0.7)',  border: 'rgb(236 72 153)' },
         ];
 
-        // Compute global Y-max across all groups (stacked totals per day)
         let globalMax = 1;
         for (const data of Object.values(window._chartData || {})) {
             const { dates, hostKeys, perHostValues, remainingTodayHours } = data;
@@ -464,7 +390,6 @@
             const { dates, hostKeys, perHostValues, remainingTodayHours } = data;
             const labels = dates.map(d => shortWeekdays[new Date(d + 'T00:00:00').getDay()]);
 
-            // One stacked dataset per host
             const datasets = hostKeys.map((ip, i) => ({
                 label: ip,
                 data: perHostValues[ip],
@@ -476,7 +401,6 @@
                 stack: 'usage',
             }));
 
-            // Remaining-today segment (top of today's bar only)
             const remainingData = dates.map(d => d === todayStr ? remainingTodayHours : 0);
             datasets.push({
                 label: 'Remaining Today',
@@ -541,7 +465,6 @@
                                 padding: 8,
                                 color: 'rgb(100 116 139)',
                                 font: { size: 11 },
-                                // Hide the remaining segment from legend if only 1 host
                                 filter: function(item) {
                                     if (!isMultiHost && item.text === 'Remaining Today') return false;
                                     return true;
@@ -657,7 +580,6 @@
             setTimeout(() => toast.classList.remove('show'), 2500);
         }
 
-        // Modal state
         let currentUsername = null;
         let timeAdjustment = 0;
 
@@ -705,7 +627,7 @@
             formData.append('operation', operation);
             formData.append('seconds', seconds);
 
-            fetch(`/api/group/${encodeURIComponent(currentUsername)}/adjust-pool`, {
+            fetch(`/api/user/${encodeURIComponent(currentUsername)}/adjust-time`, {
                 method: 'POST',
                 body: formData,
             })

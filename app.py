@@ -1,35 +1,24 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import json
 import logging
 import pytz
 
-from src.database import (
-    db,
-    ManagedUser,
-    UserTimeUsage,
-    Settings,
-    UserWeeklySchedule,
-    UserDailyTimeInterval,
-    coerce_time_spent_day,
-    coerce_int,
-    GroupTimeAdjustment,
-    group_today_limit,
-    group_spent_today,
-    pool_exhaustion_seconds,
+from src.models import (
+    db, User, Host, Account, Usage, Settings,
+    coerce_time_spent_day, config_mismatch_detail,
 )
-from src.ssh_helper import SSHClient
-from src.task_manager import BackgroundTaskManager
-from src.auth import get_authenticated_user, get_auth_mode, set_auth_mode
+from src.timekpr import SSHClient
+from src.sync import SyncManager
+from src.auth import get_authenticated_user, get_auth_mode, set_auth_mode, login_required
+from src.auto_migrate import ensure_migrated, resolve_sqlite_path
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# Get timezone from environment variable or default to UTC
 TIMEZONE_STR = os.environ.get('TZ', 'UTC')
 try:
     LOCAL_TIMEZONE = pytz.timezone(TIMEZONE_STR)
@@ -41,52 +30,50 @@ except pytz.exceptions.UnknownTimeZoneError:
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///timekpr.db'
+DATABASE_URI = os.environ.get('DATABASE_URL', 'sqlite:///timekpr.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URI
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Initialize the database
+# Migrate the old per-host schema in place, if this file still has it, before
+# any engine for this path exists in this process -- see src/auto_migrate.py.
+# Must run before db.init_app(app) below: the migration ends by replacing the
+# file on disk, which an already-open connection would not see.
+_sqlite_path = resolve_sqlite_path(DATABASE_URI, app.instance_path)
+if _sqlite_path:
+    ensure_migrated(_sqlite_path)
+
 db.init_app(app)
 
-# Initialize background task manager
-task_manager = BackgroundTaskManager()
-task_manager.init_app(app)
+sync_manager = SyncManager()
+sync_manager.init_app(app)
 
-# Admin username remains hardcoded
 ADMIN_USERNAME = 'admin'
 
-# Jinja2 filter to convert UTC datetime to local timezone
+
 @app.template_filter('localtime')
 def localtime_filter(dt):
     """Convert UTC datetime to local timezone"""
     if dt is None:
         return None
-
-    # If datetime is naive (no timezone info), assume it's UTC
     if dt.tzinfo is None:
         dt = pytz.UTC.localize(dt)
+    return dt.astimezone(LOCAL_TIMEZONE)
 
-    # Convert to local timezone
-    local_dt = dt.astimezone(LOCAL_TIMEZONE)
-    return local_dt
 
-# Jinja2 filter to format a sync timestamp, showing the date too if it's not today
 @app.template_filter('synctime')
 def synctime_filter(dt):
     """Format a UTC datetime as HH:MM, or HH:MM DD/MM if it isn't today"""
     if dt is None:
         return None
-
     local_dt = localtime_filter(dt)
     now_local = datetime.now(LOCAL_TIMEZONE)
-
     if local_dt.date() == now_local.date():
         return local_dt.strftime('%H:%M')
     return local_dt.strftime('%H:%M %d/%m')
 
-# Make timezone string available to templates
+
 @app.context_processor
 def inject_timezone():
-    """Inject timezone info into all templates"""
     return {'timezone': TIMEZONE_STR}
 
 
@@ -95,109 +82,77 @@ def _format_hm(seconds):
     h, rem = divmod(max(0, seconds), 3600)
     return f"{h}h {rem // 60}m"
 
+
+# ---------------------------------------------------------------- auth
+
 @app.route('/', methods=['GET', 'POST'])
 def login():
     auth_mode = get_auth_mode()
 
-    # If using external mode, check if already authenticated
-    if auth_mode == 'external':
-        if get_authenticated_user():
-            return redirect(url_for('dashboard'))
+    if auth_mode == 'external' and get_authenticated_user():
+        return redirect(url_for('dashboard'))
 
     error = None
-
     if request.method == 'POST':
-        # Only process login form in 'local' mode
         if auth_mode != 'local':
             flash('Login form is disabled in this mode', 'danger')
             return render_template('login.html', error='Login form is disabled', auth_mode=auth_mode)
 
         username = request.form.get('username')
         password = request.form.get('password')
-
-        # Check admin password using hash comparison
         if username == ADMIN_USERNAME and Settings.check_admin_password(password):
             session['logged_in'] = True
             flash('Login successful!', 'success')
             return redirect(url_for('dashboard'))
-        else:
-            error = 'Invalid credentials. Please try again.'
-            flash(error, 'danger')
+        error = 'Invalid credentials. Please try again.'
+        flash(error, 'danger')
 
     return render_template('login.html', error=error, auth_mode=auth_mode)
 
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    flash('You have been logged out', 'info')
+    return redirect(url_for('login'))
+
+
+# ---------------------------------------------------------------- dashboard
+
 @app.route('/dashboard')
+@login_required
 def dashboard():
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-
-    # Bust SQLAlchemy cache so we see freshly-committed usage data
     db.session.expire_all()
-    all_users = ManagedUser.query.filter_by(is_valid=True).all()
+    users = [u for u in User.query.order_by(User.username).all() if u.accounts]
 
-    # Group users by username (same name on multiple hosts → one card)
-    username_groups: dict = {}
-    for u in all_users:
-        username_groups.setdefault(u.username, []).append(u)
-
-    today = date.today()
-    offline = task_manager.get_offline_hosts()
-    logged_in_users = task_manager.get_logged_in_users()
+    offline = sync_manager.get_offline_hosts()
+    logged_in = sync_manager.get_logged_in_accounts()
     groups = []
 
-    for username, members in sorted(username_groups.items()):
-        # --- Usage data per host (7 days) ---
-        host_usage = {}  # ip → {date_str: seconds}
-        for m in members:
-            host_usage[m.system_ip] = m.get_recent_usage(days=7)
+    for user in users:
+        accounts = user.accounts
 
-        # Ordered date strings (all members share the same 7-day window)
-        dates = list(list(host_usage.values())[0].keys()) if host_usage else []
+        dates = None
+        per_host_values = []
+        for a in accounts:
+            usage = a.get_recent_usage(days=7)
+            if dates is None:
+                dates = list(usage.keys())
+            per_host_values.append({'ip': a.host.ip, 'hours': [v / 3600.0 for v in usage.values()]})
 
-        # Per-host hour arrays aligned to `dates`
-        per_host_values = [
-            {
-                'ip': m.system_ip,
-                'hours': [host_usage.get(m.system_ip, {}).get(d, 0) / 3600.0 for d in dates],
-            }
-            for m in members
-        ]
-
-        # --- Local budget projection (feeds the weekly chart's remaining-today
-        # segment only). This is what the app *intends*, not what's enforced --
-        # see the ground-truth block below for what the hosts actually report.
-        limit_seconds = group_today_limit(username)
-        total_spent_today = group_spent_today(username)
-        if limit_seconds is not None:
-            pool_remaining_seconds = max(0, limit_seconds - total_spent_today)
-            remaining_today_hours = pool_remaining_seconds / 3600.0
-        else:
-            pool_remaining_seconds = None
-            remaining_today_hours = 0.0
-
-        # --- Ground truth: what the hosts themselves report, never what the app
-        # intended. A host whose last successful read is stale is excluded so an
-        # unreachable machine can't drag a stale number into the display.
-        fresh_members = [m for m in members if not m.is_stale()]
-
-        host_left_values = [v for v in
-                             (coerce_int(m.get_config_value('TIME_LEFT_DAY')) for m in fresh_members)
-                             if v is not None]
-        enforced_time_left = max(host_left_values) if host_left_values else None
-
-        host_enforced_values = [v for v in
-                                 (m.enforced_today_seconds() for m in fresh_members)
-                                 if v is not None]
-        enforced_limit_today = max(host_enforced_values) if host_enforced_values else None
-
+        # Ground truth: what the hosts themselves report. A stale account is
+        # excluded so an unreachable machine can't drag a stale number in.
+        fresh_accounts = [a for a in accounts if not a.is_stale()]
+        left_values = [v for v in (a.time_left() for a in fresh_accounts) if v is not None]
+        enforced_time_left = max(left_values) if left_values else None
         global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Unknown"
 
-        configured_limit_today = limit_seconds  # None = unconfigured, 0 = blocked today
+        enforced_values = [v for v in (a.enforced_today_seconds() for a in fresh_accounts) if v is not None]
+        enforced_limit_today = max(enforced_values) if enforced_values else None
+        configured_limit_today = user.today_limit_seconds()
         show_limit_mismatch = (
             configured_limit_today is not None and enforced_limit_today is not None
-            and abs(configured_limit_today - enforced_limit_today) > 60
+            and configured_limit_today != enforced_limit_today
         )
         enforced_limit_today_str = (
             _format_hm(enforced_limit_today) if enforced_limit_today is not None else None
@@ -208,68 +163,40 @@ def dashboard():
             else None
         )
 
-        # --- Most-recent *successful* read across all hosts ---
-        read_times = [m.last_read_ok_at for m in members if m.last_read_ok_at]
+        pool_target = user.pool_target_seconds()
+        pool_remaining_str = _format_hm(pool_target) if pool_target is not None else None
+
+        read_times = [a.last_synced for a in accounts if a.last_synced]
         last_checked = max(read_times) if read_times else None
 
-        # --- Verification state: worst across hosts ---
-        host_states = [m.verification_state() for m in members]
-        if 'drift' in host_states:
+        states = [a.verification_state() for a in accounts]
+        if 'drift' in states:
             verification = 'drift'
-        elif 'unverified' in host_states:
+        elif 'unverified' in states:
             verification = 'unverified'
         else:
             verification = 'ok'
-        drift_details = [f"{m.system_ip}: {m.drift_detail}" for m in members if m.drift_detail]
 
-        # --- Pool-exhaustion backstop: the schedule/hours drift check above only
-        # compares configured vs. enforced *limits*, so a host that still reports
-        # positive TIME_LEFT_DAY while the shared pool is at zero wouldn't show up
-        # there -- that combination is exactly what a stuck/failed reconciliation
-        # looks like (see task_manager._reconcile_groups). Flag it as drift too, no
-        # extra SSH needed since it reuses the same reads already fetched above.
-        for m in fresh_members:
-            left = pool_exhaustion_seconds(m, pool_remaining_seconds)
-            if left is not None:
-                verification = 'drift'
-                drift_details.append(
-                    f"{m.system_ip}: pool exhausted but host reports {_format_hm(left)} left"
-                )
-
-        # --- Pending pool adjustment flag ---
-        pool_adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
-        has_pending = bool(pool_adj and pool_adj.extra_seconds != 0 and pool_adj.reconciled_at is None)
-        if not has_pending and len(members) == 1:
-            has_pending = bool(
-                members[0].pending_time_adjustment is not None and
-                members[0].pending_time_operation is not None
-            )
-
-        # --- Sync status (initial, updated by JS polling) ---
-        any_unsynced = False
-        for m in members:
-            if m.weekly_schedule and not m.weekly_schedule.is_synced:
-                any_unsynced = True
-                break
-            if UserDailyTimeInterval.query.filter_by(user_id=m.id, is_synced=False).first():
-                any_unsynced = True
-                break
+        drift_details = []
+        for a in accounts:
+            if a.verification_state() == 'drift':
+                _, detail = config_mismatch_detail(user, a)
+                if detail:
+                    drift_details.append(f"{a.host.ip}: {detail}")
 
         groups.append({
-            'username': username,
+            'username': user.username,
             'hosts': [{
-                'id': m.id,
-                'ip': m.system_ip,
-                'offline': m.system_ip in offline,
-                'in_use': m.id in logged_in_users and m.system_ip not in offline,
-                'last_read_ok_at': m.last_read_ok_at,
-            } for m in members],
-            'ids': [m.id for m in members],
-            'primary_user_id': members[0].id,
-            'dates': dates,
+                'id': a.id,
+                'ip': a.host.ip,
+                'offline': a.host.ip in offline,
+                'in_use': a.id in logged_in and a.host.ip not in offline,
+                'last_synced': a.last_synced,
+            } for a in accounts],
+            'dates': dates or [],
             'per_host_values': per_host_values,
-            'remaining_today_hours': remaining_today_hours,
-            'pool_remaining_str': _format_hm(pool_remaining_seconds) if pool_remaining_seconds is not None else None,
+            'remaining_today_hours': (pool_target / 3600.0) if pool_target is not None else 0.0,
+            'pool_remaining_str': pool_remaining_str,
             'global_time_left': global_time_left,
             'enforced_limit_today_str': enforced_limit_today_str,
             'configured_limit_today_str': configured_limit_today_str,
@@ -277,32 +204,304 @@ def dashboard():
             'verification': verification,
             'drift_details': drift_details,
             'last_checked': last_checked,
-            'has_pending': has_pending,
-            'any_unsynced': any_unsynced,
-            'is_multi_host': len(members) > 1,
+            'has_bonus': user.today_bonus_seconds() != 0,
+            'is_multi_host': len(accounts) > 1,
         })
 
     any_alarm = any(g['verification'] in ('drift', 'unverified') for g in groups)
     return render_template('dashboard.html', groups=groups, any_alarm=any_alarm)
 
+
+# ---------------------------------------------------------------- management
+
 @app.route('/admin')
+@login_required
 def admin():
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-    
-    # Get all managed users
-    users = ManagedUser.query.all()
+    users = User.query.order_by(User.username).all()
     return render_template('admin.html', users=users)
 
-@app.route('/settings', methods=['GET', 'POST'])
-def settings():
-    if not get_authenticated_user():
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
 
-    # Handle auth mode change
+@app.route('/users/add', methods=['POST'])
+@login_required
+def add_user():
+    username = (request.form.get('username') or '').strip()
+    system_ip = (request.form.get('system_ip') or '').strip()
+
+    if not username or not system_ip:
+        flash('Both username and system IP are required', 'danger')
+        return redirect(url_for('admin'))
+
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        user = User(username=username)
+        db.session.add(user)
+        db.session.commit()
+
+    host = Host.query.filter_by(ip=system_ip).first()
+    if not host:
+        host = Host(ip=system_ip)
+        db.session.add(host)
+        db.session.commit()
+
+    if Account.query.filter_by(user_id=user.id, host_id=host.id).first():
+        flash(f'{username} on {system_ip} already exists', 'warning')
+        return redirect(url_for('admin'))
+
+    account = Account(user_id=user.id, host_id=host.id)
+    db.session.add(account)
+    db.session.commit()
+
+    ssh_client = SSHClient(hostname=system_ip)
+    is_valid, message, config = ssh_client.validate_user(username)
+    if is_valid and config:
+        account.last_config = json.dumps(config)
+        account.last_synced = datetime.utcnow()
+        db.session.add(Usage(
+            account_id=account.id, date=date.today(),
+            seconds=coerce_time_spent_day(config.get('TIME_SPENT_DAY', 0)),
+        ))
+        db.session.commit()
+        flash(f'{username} added and validated on {system_ip}', 'success')
+    else:
+        account.last_error = message
+        db.session.commit()
+        flash(f'{username} added on {system_ip} but validation failed: {message}', 'warning')
+
+    return redirect(url_for('admin'))
+
+
+@app.route('/users/validate/<int:account_id>')
+@login_required
+def validate_user(account_id):
+    account = Account.query.get_or_404(account_id)
+
+    ssh_client = SSHClient(hostname=account.host.ip)
+    is_valid, message, config = ssh_client.validate_user(account.user.username)
+
+    if is_valid and config:
+        account.last_config = json.dumps(config)
+        account.last_synced = datetime.utcnow()
+        account.last_error = None
+        today = date.today()
+        seconds = coerce_time_spent_day(config.get('TIME_SPENT_DAY', 0))
+        usage = Usage.query.filter_by(account_id=account.id, date=today).first()
+        if usage:
+            usage.seconds = seconds
+        else:
+            db.session.add(Usage(account_id=account.id, date=today, seconds=seconds))
+        db.session.commit()
+        flash(f'{account.user.username} validated successfully on {account.host.ip}', 'success')
+    else:
+        account.last_error = message
+        db.session.commit()
+        flash(f'Validation failed: {message}', 'danger')
+
+    return redirect(url_for('admin'))
+
+
+@app.route('/users/delete/<int:account_id>', methods=['POST'])
+@login_required
+def delete_user(account_id):
+    account = Account.query.get_or_404(account_id)
+    user = account.user
+    host = account.host
+    username = user.username
+    ip = host.ip
+
+    db.session.delete(account)
+    db.session.commit()
+
+    # An orphaned user (no hosts left) or host (no users left) is just clutter.
+    if not user.accounts:
+        db.session.delete(user)
+    if not host.accounts:
+        db.session.delete(host)
+    db.session.commit()
+
+    flash(f'{username} removed from {ip}', 'success')
+    return redirect(url_for('admin'))
+
+
+# ---------------------------------------------------------------- schedule
+
+@app.route('/weekly-schedule/<username>')
+@login_required
+def weekly_schedule(username):
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        flash(f'No user found: {username}', 'danger')
+        return redirect(url_for('dashboard'))
+
+    user.ensure_day_limits()
+    day_limits = {dl.day_of_week: dl for dl in user.day_limits}
+    hosts_str = ', '.join(a.host.ip for a in user.accounts)
+    return render_template('weekly_schedule.html', user=user, day_limits=day_limits, hosts_str=hosts_str)
+
+
+@app.route('/weekly-schedule/update', methods=['POST'])
+@login_required
+def update_weekly_schedule():
+    username = (request.form.get('username') or '').strip()
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        flash('User not found', 'danger')
+        return redirect(url_for('dashboard'))
+
+    user.ensure_day_limits()
+    by_day = {dl.day_of_week: dl for dl in user.day_limits}
+
+    for day in range(1, 8):
+        dl = by_day[day]
+        try:
+            hours = max(0.0, min(24.0, float(request.form.get(f'hours_{day}', '0'))))
+        except (TypeError, ValueError):
+            hours = 0.0
+        dl.limit_seconds = int(round(hours * 3600))
+        dl.hours_enabled = request.form.get(f'hours_enabled_{day}') == 'on'
+        # Hour-only picker (no minute UI): end_hour may be 24 ("23:59" in the
+        # select), which hour_tokens()'s range(start, end) already turns into
+        # hours 0..23 correctly -- no need for the old 23h59m conversion.
+        try:
+            dl.start_hour = int(request.form.get(f'start_hour_{day}', dl.start_hour))
+            dl.end_hour = int(request.form.get(f'end_hour_{day}', dl.end_hour))
+        except (TypeError, ValueError):
+            pass
+        dl.start_minute = 0
+        dl.end_minute = 0
+        if dl.hours_enabled and not dl.is_valid_interval():
+            db.session.rollback()
+            flash(f'Invalid time interval for {dl.day_name()}: start time must be before end time', 'danger')
+            return redirect(url_for('weekly_schedule', username=username))
+
+    # A manual edit is a fresh intent -- let the next sync cycle re-evaluate
+    # drift from scratch instead of carrying over an alarm from before the edit.
+    for a in user.accounts:
+        a.drift_since = None
+
+    db.session.commit()
+    flash(f'Weekly schedule updated for {username}', 'success')
+    return redirect(url_for('weekly_schedule', username=username))
+
+
+# ---------------------------------------------------------------- history
+
+@app.route('/stats/<username>')
+@login_required
+def user_stats(username):
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        flash(f'No user found: {username}', 'danger')
+        return redirect(url_for('dashboard'))
+
+    return render_template(
+        'stats.html',
+        user=user,
+        hosts_str=', '.join(a.host.ip for a in user.accounts),
+        daily_30=user.get_recent_usage(days=30),
+        weekly_13=user.get_usage_weekly_grouped(weeks=13),
+        monthly_12=user.get_usage_monthly_grouped(months=12),
+        all_monthly=user.get_all_usage_monthly(),
+    )
+
+
+# ---------------------------------------------------------------- time adjustment
+
+@app.route('/api/user/<username>/adjust-time', methods=['POST'])
+@login_required
+def adjust_time(username):
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({'success': False, 'message': 'User not found'}), 404
+
+    operation = request.form.get('operation')
+    seconds_str = request.form.get('seconds')
+    if operation not in ('+', '-') or not seconds_str:
+        return jsonify({'success': False, 'message': 'Missing or invalid parameters'}), 400
+    try:
+        seconds = int(seconds_str)
+    except ValueError:
+        return jsonify({'success': False, 'message': 'Invalid seconds value'}), 400
+
+    signed = seconds if operation == '+' else -seconds
+    bonus = user.add_bonus(signed)
+    total_min = bonus.seconds // 60
+    sign_str = '+' if total_min >= 0 else ''
+
+    return jsonify({
+        'success': True,
+        'message': (f"Adjusted {operation}{seconds // 60}m "
+                    f"(total today: {sign_str}{total_min}m). "
+                    "Applies to every host within about a minute."),
+        'refresh': True,
+    })
+
+
+# ---------------------------------------------------------------- live status (single endpoint)
+
+@app.route('/api/status')
+@login_required
+def api_status():
+    offline = sync_manager.get_offline_hosts()
+    logged_in = sync_manager.get_logged_in_accounts()
+
+    users_payload = {}
+    for user in User.query.all():
+        accounts = user.accounts
+        if not accounts:
+            continue
+
+        states = [a.verification_state() for a in accounts]
+        if 'drift' in states:
+            verification = 'drift'
+        elif 'unverified' in states:
+            verification = 'unverified'
+        else:
+            verification = 'ok'
+
+        drift_details = []
+        for a in accounts:
+            if a.verification_state() == 'drift':
+                _, detail = config_mismatch_detail(user, a)
+                if detail:
+                    drift_details.append(f"{a.host.ip}: {detail}")
+
+        fresh = [a for a in accounts if not a.is_stale()]
+        left_values = [v for v in (a.time_left() for a in fresh) if v is not None]
+        time_left = max(left_values) if left_values else None
+        pool_target = user.pool_target_seconds()
+
+        users_payload[user.username] = {
+            'verification': verification,
+            'drift_details': drift_details,
+            'time_left_str': _format_hm(time_left) if time_left is not None else 'Unknown',
+            'pool_remaining_str': _format_hm(pool_target) if pool_target is not None else None,
+            'accounts': {
+                a.id: {
+                    'ip': a.host.ip,
+                    'offline': a.host.ip in offline,
+                    'in_use': a.id in logged_in and a.host.ip not in offline,
+                    'last_synced_iso': a.last_synced.isoformat() + 'Z' if a.last_synced else None,
+                    'last_error': a.last_error,
+                } for a in accounts
+            },
+        }
+
+    return jsonify({'success': True, 'sync': sync_manager.get_status(), 'users': users_payload})
+
+
+@app.route('/restart-tasks')
+@login_required
+def restart_tasks():
+    sync_manager.restart()
+    flash('Sync loop restarted', 'success')
+    return redirect(request.referrer or url_for('dashboard'))
+
+
+# ---------------------------------------------------------------- settings
+
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings():
     if request.method == 'POST':
         action = request.form.get('action')
 
@@ -311,7 +510,6 @@ def settings():
             new_password = request.form.get('new_password')
             confirm_password = request.form.get('confirm_password')
 
-            # Validate inputs
             if not current_password or not new_password or not confirm_password:
                 flash('All fields are required', 'danger')
             elif not Settings.check_admin_password(current_password):
@@ -321,7 +519,6 @@ def settings():
             elif len(new_password) < 4:
                 flash('New password must be at least 4 characters long', 'danger')
             else:
-                # Update the password with hashing
                 Settings.set_admin_password(new_password)
                 flash('Password updated successfully', 'success')
                 return redirect(url_for('settings'))
@@ -336,918 +533,40 @@ def settings():
                 flash(f'Error: {str(e)}', 'danger')
 
         elif action == 'change_sync_settings':
-            errors = []
-            int_fields = {
-                'RECONCILE_THRESHOLD':       request.form.get('reconcile_threshold', ''),
-                'RECONCILE_ACTIVE_INTERVAL': request.form.get('reconcile_active_interval', ''),
-                'RECONCILE_IDLE_INTERVAL':   request.form.get('reconcile_idle_interval', ''),
-            }
-            for key, raw in int_fields.items():
-                try:
-                    val = int(raw)
-                    if val <= 0:
-                        raise ValueError
-                except (ValueError, TypeError):
-                    errors.append(f'Invalid value for {key}: must be a positive integer.')
-            if errors:
-                for msg in errors:
-                    flash(msg, 'danger')
+            raw = request.form.get('propagation_threshold', '')
+            try:
+                val = int(raw)
+                if val <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                flash('Invalid value for propagation threshold: must be a positive integer.', 'danger')
             else:
-                for key, raw in int_fields.items():
-                    Settings.set_value(key, str(int(raw)))
-                skip = 'true' if request.form.get('skip_active_host') == 'on' else 'false'
-                Settings.set_value('SKIP_ACTIVE_HOST', skip)
+                Settings.set_value('PROPAGATION_THRESHOLD', str(val))
                 flash('Synchronization settings updated', 'success')
                 return redirect(url_for('settings'))
 
-    # Get current auth settings
-    current_auth_mode = get_auth_mode()
-
-    return render_template('settings.html',
-                         current_auth_mode=current_auth_mode,
-                         reconcile_threshold=Settings.get_int('RECONCILE_THRESHOLD', 300),
-                         reconcile_active_interval=Settings.get_int('RECONCILE_ACTIVE_INTERVAL', 120),
-                         reconcile_idle_interval=Settings.get_int('RECONCILE_IDLE_INTERVAL', 180),
-                         skip_active_host=Settings.get_value('SKIP_ACTIVE_HOST', 'true') == 'true')
-
-@app.route('/api/task-status')
-def get_task_status():
-    """Get the status of the background task manager"""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    status = task_manager.get_status()
-    return jsonify({
-        'success': True,
-        'status': status
-    })
-
-@app.route('/api/host-status')
-def host_status():
-    """Return which host IPs are currently offline (SSH failing / in backoff)."""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    offline_ips = task_manager.get_offline_hosts()
-    logged_in_users = task_manager.get_logged_in_users()
-    in_use_ids = [
-        m.id for m in ManagedUser.query.filter_by(is_valid=True).all()
-        if m.id in logged_in_users and m.system_ip not in offline_ips
-    ]
-    return jsonify({
-        'success': True,
-        'offline_ips': sorted(offline_ips),
-        'in_use_ids': in_use_ids,
-    })
-
-@app.route('/restart-tasks')
-def restart_tasks():
-    """Restart the background task manager"""
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-    
-    task_manager.restart()
-    flash('Background tasks restarted', 'success')
-    
-    # Redirect back to the referring page
-    referrer = request.referrer
-    if referrer:
-        return redirect(referrer)
-    else:
-        return redirect(url_for('dashboard'))
-
-@app.route('/logout')
-def logout():
-    session.pop('logged_in', None)
-    flash('You have been logged out', 'info')
-    return redirect(url_for('login'))
-
-@app.route('/users/add', methods=['GET', 'POST'])
-def add_user():
-    if not session.get('logged_in'):
-        if request.method == 'GET':
-            flash('Please login first', 'warning')
-            return redirect(url_for('login'))
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-
-    if request.method == 'GET':
-        return redirect(url_for('admin'))
-    
-    username = request.form.get('username')
-    system_ip = request.form.get('system_ip')
-    
-    if not username or not system_ip:
-        flash('Both username and system IP are required', 'danger')
-        return redirect(url_for('admin'))
-    
-    # Check if user already exists
-    existing_user = ManagedUser.query.filter_by(username=username, system_ip=system_ip).first()
-    
-    if existing_user:
-        flash(f'User {username} on {system_ip} already exists', 'warning')
-        return redirect(url_for('admin'))
-    
-    # Create new user
-    new_user = ManagedUser(username=username, system_ip=system_ip)
-    
-    # Validate with timekpr
-    ssh_client = SSHClient(hostname=system_ip)
-    is_valid, message, config_dict = ssh_client.validate_user(username)
-    
-    new_user.is_valid = is_valid
-    new_user.last_checked = datetime.utcnow()
-    
-    if is_valid and config_dict:
-        new_user.last_config = json.dumps(config_dict)
-
-        # Add the user to get an ID first
-        db.session.add(new_user)
-        db.session.commit()
-
-        # Add today's usage data
-        today = date.today()
-        time_spent = coerce_time_spent_day(config_dict.get('TIME_SPENT_DAY', 0))
-        usage = UserTimeUsage(user_id=new_user.id, date=today, time_spent=time_spent)
-        db.session.add(usage)
-
-        # Inherit group schedule/intervals if other hosts already exist for this username
-        existing_peers = ManagedUser.query.filter(
-            ManagedUser.username == username,
-            ManagedUser.id != new_user.id,
-        ).all()
-        for peer in existing_peers:
-            if peer.weekly_schedule:
-                sched = UserWeeklySchedule(user_id=new_user.id)
-                sched.set_schedule_from_dict(peer.weekly_schedule.get_schedule_dict())
-                db.session.add(sched)
-                for interval in peer.time_intervals:
-                    new_ivl = UserDailyTimeInterval(
-                        user_id=new_user.id,
-                        day_of_week=interval.day_of_week,
-                        start_hour=interval.start_hour,
-                        start_minute=interval.start_minute,
-                        end_hour=interval.end_hour,
-                        end_minute=interval.end_minute,
-                        is_enabled=interval.is_enabled,
-                        is_synced=False,
-                    )
-                    db.session.add(new_ivl)
-                break  # one peer's schedule is enough
-
-        db.session.commit()
-        flash(f'User {username} added and validated successfully', 'success')
-    else:
-        db.session.add(new_user)
-        db.session.commit()
-        flash(f'User {username} added but validation failed: {message}', 'warning')
-
-    return redirect(url_for('admin'))
-
-@app.route('/users/validate/<int:user_id>')
-def validate_user(user_id):
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    user = ManagedUser.query.get_or_404(user_id)
-    
-    # Validate with timekpr
-    ssh_client = SSHClient(hostname=user.system_ip)
-    is_valid, message, config_dict = ssh_client.validate_user(user.username)
-    
-    user.is_valid = is_valid
-    user.last_checked = datetime.utcnow()
-    
-    if is_valid and config_dict:
-        user.last_config = json.dumps(config_dict)
-        
-        # Update today's usage data
-        today = date.today()
-        time_spent = coerce_time_spent_day(config_dict.get('TIME_SPENT_DAY', 0))
-        
-        # Look for an existing record for today
-        usage = UserTimeUsage.query.filter_by(
-            user_id=user.id,
-            date=today
-        ).first()
-        
-        if usage:
-            usage.time_spent = time_spent
-        else:
-            # Create a new record
-            usage = UserTimeUsage(
-                user_id=user.id,
-                date=today,
-                time_spent=time_spent
-            )
-            db.session.add(usage)
-        
-        db.session.commit()
-        flash(f'User {user.username} validated successfully', 'success')
-    else:
-        db.session.commit()
-        flash(f'User validation failed: {message}', 'danger')
-    
-    return redirect(url_for('admin'))
-
-@app.route('/users/delete/<int:user_id>', methods=['POST'])
-def delete_user(user_id):
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    user = ManagedUser.query.get_or_404(user_id)
-    username = user.username
-    
-    db.session.delete(user)
-    db.session.commit()
-    
-    flash(f'User {username} removed successfully', 'success')
-    return redirect(url_for('admin'))
-
-@app.route('/api/user/<int:user_id>/usage')
-def get_user_usage(user_id):
-    """API endpoint to get user usage data"""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    user = ManagedUser.query.get_or_404(user_id)
-    days = request.args.get('days', 7, type=int)
-    
-    usage_data = user.get_recent_usage(days=days)
-    
-    # Format for chart.js
-    labels = list(usage_data.keys())
-    values = list(usage_data.values())
-    
-    # Convert seconds to hours for better readability
-    values_hours = [round(v / 3600, 1) for v in values]
-    
-    return jsonify({
-        'success': True,
-        'labels': labels,
-        'values': values_hours,
-        'username': user.username
-    })
-
-@app.route('/weekly-schedule/<int:user_id>')
-def weekly_schedule_user(user_id):
-    """Display weekly schedule management page for a single host (legacy / admin use)."""
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-
-    user = ManagedUser.query.get_or_404(user_id)
-
-    if not user.weekly_schedule:
-        schedule = UserWeeklySchedule(user_id=user.id)
-        db.session.add(schedule)
-        db.session.commit()
-
     return render_template(
-        'weekly_schedule_single.html',
-        user=user,
-        group_username='',
-        member_ids=[user.id],
-        hosts_str=user.system_ip,
+        'settings.html',
+        current_auth_mode=get_auth_mode(),
+        propagation_threshold=Settings.get_int('PROPAGATION_THRESHOLD', SyncManager.PROPAGATION_THRESHOLD_DEFAULT),
     )
 
 
-@app.route('/weekly-schedule/group/<username>')
-def weekly_schedule_group(username):
-    """Display weekly schedule management page for a username group."""
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-
-    members = ManagedUser.query.filter_by(username=username).all()
-    if not members:
-        flash(f'No users found with username {username}', 'danger')
-        return redirect(url_for('dashboard'))
-
-    # Use first member as the representative (form values, interval loading)
-    user = members[0]
-    if not user.weekly_schedule:
-        schedule = UserWeeklySchedule(user_id=user.id)
-        db.session.add(schedule)
-        db.session.commit()
-
-    member_ids = [m.id for m in members]
-    hosts_str = ', '.join(m.system_ip for m in members)
-
-    return render_template(
-        'weekly_schedule_single.html',
-        user=user,
-        group_username=username,
-        member_ids=member_ids,
-        hosts_str=hosts_str,
-    )
-
-@app.route('/weekly-schedule/update', methods=['POST'])
-def update_weekly_schedule():
-    """Update weekly schedule — fans out to all group members when group_username is set."""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-
-    days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-    schedule_data = {}
-    for day in days:
-        try:
-            hours = float(request.form.get(day, '0'))
-            hours = max(0.0, min(24.0, hours))
-        except (ValueError, TypeError):
-            hours = 0.0
-        schedule_data[day] = hours
-
-    group_username = request.form.get('group_username', '').strip()
-
-    if group_username:
-        # Fan out to every host with this username
-        members = ManagedUser.query.filter_by(username=group_username).all()
-        if not members:
-            flash(f'No users found for {group_username}', 'danger')
-            return redirect(url_for('dashboard'))
-        try:
-            for m in members:
-                if not m.weekly_schedule:
-                    sched = UserWeeklySchedule(user_id=m.id)
-                    db.session.add(sched)
-                    db.session.flush()
-                    m.weekly_schedule = sched
-                m.weekly_schedule.set_schedule_from_dict(schedule_data)
-                # Re-arm the one-shot drift auto-repair: a manual edit is a fresh intent.
-                m.drift_repush_at = None
-            db.session.commit()
-            task_manager.trigger_sync()
-            flash(f'Weekly schedule updated for all hosts of {group_username}', 'success')
-        except Exception as e:
-            db.session.rollback()
-            flash(f'Error updating schedule: {str(e)}', 'danger')
-        return redirect(url_for('weekly_schedule_group', username=group_username))
-
-    # Single-host fallback
-    user_id = request.form.get('user_id')
-    if not user_id:
-        flash('User ID is required', 'danger')
-        return redirect(url_for('dashboard'))
-    try:
-        user_id = int(user_id)
-    except ValueError:
-        flash('Invalid user ID', 'danger')
-        return redirect(url_for('dashboard'))
-
-    user = ManagedUser.query.get_or_404(user_id)
-    if not user.weekly_schedule:
-        schedule = UserWeeklySchedule(user_id=user.id)
-        db.session.add(schedule)
-        db.session.flush()
-        user.weekly_schedule = schedule
-    else:
-        schedule = user.weekly_schedule
-
-    schedule.set_schedule_from_dict(schedule_data)
-    user.drift_repush_at = None  # re-arm the one-shot drift auto-repair on manual edit
-    try:
-        db.session.commit()
-        task_manager.trigger_sync()
-        flash(f'Weekly schedule updated for {user.username}', 'success')
-    except Exception as e:
-        db.session.rollback()
-        flash(f'Error updating schedule: {str(e)}', 'danger')
-    return redirect(url_for('weekly_schedule_user', user_id=user.id))
-
-@app.route('/api/user/<int:user_id>/intervals')
-def get_user_intervals(user_id):
-    """API endpoint to get user time intervals"""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    user = ManagedUser.query.get_or_404(user_id)
-    
-    # Get all intervals for this user
-    intervals = UserDailyTimeInterval.query.filter_by(user_id=user.id).all()
-    
-    # Format intervals by day
-    intervals_dict = {}
-    for interval in intervals:
-        intervals_dict[interval.day_of_week] = {
-            'id': interval.id,
-            'day_name': interval.get_day_name(),
-            'start_hour': interval.start_hour,
-            'start_minute': interval.start_minute,
-            'end_hour': interval.end_hour,
-            'end_minute': interval.end_minute,
-            'is_enabled': interval.is_enabled,
-            'is_synced': interval.is_synced,
-            'time_range': interval.get_time_range_string(),
-            'last_synced': interval.last_synced.strftime('%Y-%m-%d %H:%M') if interval.last_synced else None
-        }
-    
-    return jsonify({
-        'success': True,
-        'intervals': intervals_dict,
-        'username': user.username
-    })
-
-@app.route('/api/user/<int:user_id>/intervals/update', methods=['POST'])
-def update_user_intervals(user_id):
-    """API endpoint to update user time intervals"""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    user = ManagedUser.query.get_or_404(user_id)
-    
-    try:
-        # Get interval data from request
-        data = request.get_json()
-        if not data:
-            return jsonify({'success': False, 'message': 'No data provided'}), 400
-        
-        intervals_data = data.get('intervals', {})
-        
-        for day_str, interval_data in intervals_data.items():
-            try:
-                day_of_week = int(day_str)
-                if not (1 <= day_of_week <= 7):
-                    continue
-                
-                # Get or create interval for this day
-                interval = UserDailyTimeInterval.query.filter_by(
-                    user_id=user.id,
-                    day_of_week=day_of_week
-                ).first()
-                
-                if not interval:
-                    interval = UserDailyTimeInterval(
-                        user_id=user.id,
-                        day_of_week=day_of_week
-                    )
-                    db.session.add(interval)
-                
-                # Update interval properties
-                interval.start_hour = int(interval_data.get('start_hour', 9))
-                interval.start_minute = int(interval_data.get('start_minute', 0))
-                interval.end_hour = int(interval_data.get('end_hour', 17))
-                interval.end_minute = int(interval_data.get('end_minute', 0))
-                interval.is_enabled = bool(interval_data.get('is_enabled', False))
-                
-                # Validate the interval
-                if not interval.is_valid_interval():
-                    return jsonify({
-                        'success': False,
-                        'message': f'Invalid time interval for {interval.get_day_name()}: start time must be before end time'
-                    }), 400
-                
-                # Mark as modified (needs sync)
-                interval.mark_modified()
-                
-            except (ValueError, KeyError) as e:
-                return jsonify({
-                    'success': False,
-                    'message': f'Invalid data format: {str(e)}'
-                }), 400
-        
-        db.session.commit()
-        task_manager.trigger_sync()
-
-        return jsonify({
-            'success': True,
-            'message': f'Time intervals updated for {user.username}',
-            'username': user.username
-        })
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({
-            'success': False,
-            'message': f'Error updating intervals: {str(e)}'
-        }), 500
-
-@app.route('/api/user/<int:user_id>/intervals/sync-status')
-def get_intervals_sync_status(user_id):
-    """Get sync status of user's time intervals"""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    user = ManagedUser.query.get_or_404(user_id)
-    
-    # Get all intervals for this user
-    intervals = UserDailyTimeInterval.query.filter_by(user_id=user.id).all()
-    
-    # Check if any intervals need sync
-    needs_sync = any(not interval.is_synced for interval in intervals)
-    
-    # Get last sync time (most recent among all intervals)
-    last_synced = None
-    if intervals:
-        synced_intervals = [i for i in intervals if i.last_synced]
-        if synced_intervals:
-            last_synced = max(i.last_synced for i in synced_intervals)
-            last_synced = last_synced.strftime('%Y-%m-%d %H:%M')
-    
-    # Count enabled vs total intervals
-    enabled_count = sum(1 for i in intervals if i.is_enabled)
-    total_count = len(intervals)
-    
-    return jsonify({
-        'success': True,
-        'needs_sync': needs_sync,
-        'last_synced': last_synced,
-        'enabled_intervals': enabled_count,
-        'total_intervals': total_count,
-        'username': user.username
-    })
-
-@app.route('/api/schedule-sync-status/<int:user_id>')
-def get_schedule_sync_status(user_id):
-    """Get the sync/verification status of a user's weekly schedule.
-
-    All-DB-read, no SSH: this is polled by the dashboard every 5s and must stay
-    that way (see CLAUDE.md command-budget note).
-    """
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-
-    user = ManagedUser.query.get_or_404(user_id)
-
-    offline = user.system_ip in task_manager.get_offline_hosts()
-    intervals_synced = UserDailyTimeInterval.query.filter_by(
-        user_id=user.id, is_synced=False
-    ).first() is None
-    last_sync_error_at = (
-        user.last_sync_error_at.strftime('%Y-%m-%d %H:%M') if user.last_sync_error_at else None
-    )
-    enforced_today = user.enforced_today_seconds()
-    configured_today = None
-    if user.weekly_schedule:
-        configured_today = user.weekly_schedule.get_schedule_dict().get(
-            ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'][date.today().weekday()], 0
-        )
-        configured_today = int(round((configured_today or 0) * 3600))
-
-    # Pool-exhaustion backstop, same signal as the dashboard route: a host that
-    # still reports positive TIME_LEFT_DAY while the group's shared pool is at
-    # zero means a reconciliation push didn't stick (or hasn't landed yet).
-    # This is what keeps the dashboard alarm banner alive across the 5s polling
-    # cycle instead of it only showing on the initial page render.
-    verification_state = user.verification_state()
-    drift_detail = user.drift_detail
-    if verification_state != 'drift' and not offline and not user.is_stale():
-        pool_limit = group_today_limit(user.username)
-        if pool_limit is not None:
-            pool_remaining = max(0, pool_limit - group_spent_today(user.username))
-            left = pool_exhaustion_seconds(user, pool_remaining)
-            if left is not None:
-                verification_state = 'drift'
-                drift_detail = f"pool exhausted but host reports {_format_hm(left)} left"
-
-    payload = {
-        'success': True,
-        'system_ip': user.system_ip,
-        'offline': offline,
-        'intervals_synced': intervals_synced,
-        'last_sync_error': user.last_sync_error,
-        'last_sync_error_at': last_sync_error_at,
-        'verification_state': verification_state,
-        'drift_detail': drift_detail,
-        'drift_since': user.drift_since.strftime('%Y-%m-%d %H:%M') if user.drift_since else None,
-        'limits_verified_at': user.limits_verified_at.strftime('%Y-%m-%d %H:%M') if user.limits_verified_at else None,
-        'last_read_ok_at_iso': user.last_read_ok_at.isoformat() + 'Z' if user.last_read_ok_at else None,
-        'stale': user.is_stale(),
-        'time_left_day': coerce_int(user.get_config_value('TIME_LEFT_DAY')),
-        'enforced_today_seconds': enforced_today,
-        'configured_today_seconds': configured_today,
-    }
-
-    if user.weekly_schedule:
-        schedule_dict = user.weekly_schedule.get_schedule_dict()
-        last_synced = None
-        if user.weekly_schedule.last_synced:
-            last_synced = user.weekly_schedule.last_synced.strftime('%Y-%m-%d %H:%M')
-        payload.update({
-            'is_synced': user.weekly_schedule.is_synced,
-            'schedule': schedule_dict,
-            'last_synced': last_synced,
-            'last_modified': user.weekly_schedule.last_modified.strftime('%Y-%m-%d %H:%M') if user.weekly_schedule.last_modified else None,
-        })
-    else:
-        payload.update({
-            'is_synced': True,  # No schedule means no push pending -- but verification_state above still reports it
-            'schedule': None,
-            'last_synced': None,
-            'last_modified': None,
-        })
-
-    return jsonify(payload)
-
-@app.route('/stats/<int:user_id>')
-def user_stats(user_id):
-    """Display extended usage history for a single host."""
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-
-    user = ManagedUser.query.get_or_404(user_id)
-    return render_template('stats.html',
-        user=user,
-        daily_30=user.get_recent_usage(days=30),
-        weekly_13=user.get_usage_weekly_grouped(weeks=13),
-        monthly_12=user.get_usage_monthly_grouped(months=12),
-        all_monthly=user.get_all_usage_monthly(),
-    )
-
-
-@app.route('/stats/group/<username>')
-def group_stats(username):
-    """Display aggregated usage history across all hosts of a username group."""
-    user = get_authenticated_user()
-    if not user:
-        flash('Please login first', 'warning')
-        return redirect(url_for('login'))
-
-    members = ManagedUser.query.filter_by(username=username).all()
-    if not members:
-        flash(f'No users found with username {username}', 'danger')
-        return redirect(url_for('dashboard'))
-
-    from collections import defaultdict
-
-    # daily_30: sum seconds per date across all hosts
-    daily_30: dict = {}
-    for m in members:
-        for d, s in m.get_recent_usage(days=30).items():
-            daily_30[d] = daily_30.get(d, 0) + s
-    daily_30 = dict(sorted(daily_30.items()))
-
-    # weekly_13
-    weekly_map: dict = {}
-    for m in members:
-        for w in m.get_usage_weekly_grouped(weeks=13):
-            k = w['week_start']
-            if k not in weekly_map:
-                weekly_map[k] = {'label': w['label'], 'week_start': k, 'total': 0}
-            weekly_map[k]['total'] += w['total']
-    weekly_13 = [weekly_map[k] for k in sorted(weekly_map)]
-
-    # monthly_12
-    monthly_map: dict = {}
-    for m in members:
-        for mo in m.get_usage_monthly_grouped(months=12):
-            k = mo['month']
-            if k not in monthly_map:
-                monthly_map[k] = {'label': mo['label'], 'month': k, 'total': 0}
-            monthly_map[k]['total'] += mo['total']
-    monthly_12 = [monthly_map[k] for k in sorted(monthly_map)]
-
-    # all_monthly
-    allmo_map: dict = {}
-    for m in members:
-        for mo in m.get_all_usage_monthly():
-            k = mo['month']
-            if k not in allmo_map:
-                allmo_map[k] = {'label': mo['label'], 'month': k, 'total': 0}
-            allmo_map[k]['total'] += mo['total']
-    all_monthly = [allmo_map[k] for k in sorted(allmo_map)]
-
-    from types import SimpleNamespace
-    stats_user = SimpleNamespace(
-        username=username,
-        system_ip=', '.join(m.system_ip for m in members),
-    )
-    return render_template('stats.html',
-        user=stats_user,
-        daily_30=daily_30,
-        weekly_13=weekly_13,
-        monthly_12=monthly_12,
-        all_monthly=all_monthly,
-    )
-
-@app.route('/api/modify-time', methods=['POST'])
-def modify_time():
-    """Modify time left for a user"""
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-    
-    # Get parameters from request
-    user_id = request.form.get('user_id')
-    operation = request.form.get('operation')
-    seconds = request.form.get('seconds')
-    
-    if not user_id or not operation or not seconds:
-        return jsonify({'success': False, 'message': 'Missing required parameters'}), 400
-    
-    try:
-        user_id = int(user_id)
-        seconds = int(seconds)
-    except ValueError:
-        return jsonify({'success': False, 'message': 'Invalid parameter format'}), 400
-    
-    # Validate operation
-    if operation not in ['+', '-']:
-        return jsonify({'success': False, 'message': "Operation must be '+' or '-'"}), 400
-    
-    # Get user from database
-    user = ManagedUser.query.get_or_404(user_id)
-    
-    # Create SSH client
-    ssh_client = SSHClient(hostname=user.system_ip)
-    
-    # Execute the command
-    success, message = ssh_client.modify_time_left(user.username, operation, seconds)
-    
-    if success:
-        # Update user info to reflect changes
-        is_valid, _, config_dict = ssh_client.validate_user(user.username)
-        if is_valid and config_dict:
-            user.last_checked = datetime.utcnow()
-            user.last_config = json.dumps(config_dict)
-            # Clear any pending adjustments since we succeeded
-            user.pending_time_adjustment = None
-            user.pending_time_operation = None
-            db.session.commit()
-            
-        return jsonify({
-            'success': True,
-            'message': message,
-            'username': user.username,
-            'refresh': True
-        })
-    else:
-        # Store as pending adjustment if it failed
-        user.pending_time_adjustment = seconds
-        user.pending_time_operation = operation
-        db.session.commit()
-        task_manager.trigger_sync()
-
-        return jsonify({
-            'success': True,  # We report success since we stored it for later
-            'message': f"Computer seems to be offline. Time adjustment of {operation}{seconds} seconds has been queued and will be applied when the computer comes online.",
-            'username': user.username,
-            'pending': True,
-            'refresh': True
-        })
-
-@app.route('/api/group/<username>/adjust-pool', methods=['POST'])
-def group_adjust_pool(username):
-    """Add or subtract time from the shared pool for a username group.
-
-    For single-host groups the request is forwarded immediately to the host
-    (with pending-retry on failure).  For multi-host groups a
-    GroupTimeAdjustment record is created/updated; the reconciliation loop
-    will propagate the change to all hosts within the next 10 s cycle.
-    """
-    user = get_authenticated_user()
-    if not user:
-        return jsonify({'success': False, 'message': 'Not authenticated'}), 401
-
-    operation = request.form.get('operation')
-    seconds_str = request.form.get('seconds')
-
-    if not operation or not seconds_str:
-        return jsonify({'success': False, 'message': 'Missing required parameters'}), 400
-    if operation not in ['+', '-']:
-        return jsonify({'success': False, 'message': "Operation must be '+' or '-'"}), 400
-    try:
-        seconds = int(seconds_str)
-    except ValueError:
-        return jsonify({'success': False, 'message': 'Invalid seconds value'}), 400
-
-    members = ManagedUser.query.filter_by(username=username, is_valid=True).all()
-    if not members:
-        return jsonify({'success': False, 'message': f'No valid users found for {username}'}), 404
-
-    today = date.today()
-
-    if len(members) == 1:
-        # Single-host: use existing direct SSH + pending fallback
-        user = members[0]
-        ssh_client = SSHClient(hostname=user.system_ip)
-        success, message = ssh_client.modify_time_left(username, operation, seconds)
-        if success:
-            is_valid, _, config_dict = ssh_client.validate_user(username)
-            if is_valid and config_dict:
-                user.last_checked = datetime.utcnow()
-                user.last_config = json.dumps(config_dict)
-                user.pending_time_adjustment = None
-                user.pending_time_operation = None
-            # Update GroupTimeAdjustment so the dashboard limit reflects the extra time
-            signed = seconds if operation == '+' else -seconds
-            adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
-            if adj:
-                adj.extra_seconds += signed
-                adj.reconciled_at = datetime.utcnow()
-            else:
-                adj = GroupTimeAdjustment(
-                    username=username, date=today,
-                    extra_seconds=signed, reconciled_at=datetime.utcnow(),
-                )
-                db.session.add(adj)
-            db.session.commit()
-            return jsonify({'success': True, 'message': message, 'refresh': True})
-        else:
-            user.pending_time_adjustment = seconds
-            user.pending_time_operation = operation
-            db.session.commit()
-            task_manager.trigger_sync()
-            return jsonify({
-                'success': True,
-                'message': (f"Computer offline. Adjustment of {operation}{seconds // 60}m "
-                            "queued and will apply when it reconnects."),
-                'pending': True,
-                'refresh': True,
-            })
-
-    # Multi-host: upsert GroupTimeAdjustment
-    signed = seconds if operation == '+' else -seconds
-    adj = GroupTimeAdjustment.query.filter_by(username=username, date=today).first()
-    if adj:
-        adj.extra_seconds += signed
-        adj.reconciled_at = None  # reset so badge reappears until next reconciliation cycle
-    else:
-        adj = GroupTimeAdjustment(username=username, date=today, extra_seconds=signed)
-        db.session.add(adj)
-    db.session.commit()
-    task_manager.trigger_sync()
-
-    total_min = adj.extra_seconds // 60
-    sign_str = '+' if total_min >= 0 else ''
-    return jsonify({
-        'success': True,
-        'message': (f"Pool adjusted {operation}{seconds // 60}m "
-                    f"(total today: {sign_str}{total_min}m). "
-                    "All hosts will be updated within 10 seconds."),
-        'refresh': True,
-    })
-
-
-# With app context
+# With app context: create schema, seed defaults, start the sync loop.
 with app.app_context():
     db.create_all()
     print("Database tables verified")
 
-    # Additive, idempotent migrations for existing DBs. No migration framework is
-    # used in this project; new columns are added here, one line each.
-    _ADDITIVE_COLUMNS = {
-        'group_time_adjustment': {
-            'reconciled_at': 'DATETIME',
-        },
-        'managed_user': {
-            'last_sync_error': 'TEXT',
-            'last_sync_error_at': 'DATETIME',
-            'last_read_ok_at': 'DATETIME',
-            'limits_verified_at': 'DATETIME',
-            'drift_detail': 'TEXT',
-            'drift_since': 'DATETIME',
-            'drift_repush_at': 'DATETIME',
-        },
-    }
-    with db.engine.connect() as conn:
-        for table, columns in _ADDITIVE_COLUMNS.items():
-            existing = [row[1] for row in conn.execute(db.text(f"PRAGMA table_info({table})"))]
-            for column, sql_type in columns.items():
-                if column not in existing:
-                    conn.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
-                    conn.commit()
-                    print(f"Migrated {table}: added {column} column")
-
-    # Initialize admin password if it doesn't exist
-    if not Settings.get_value('admin_password_hash', None) and not Settings.get_value('admin_password', None):
+    if not Settings.get_value('admin_password_hash', None):
         Settings.set_admin_password('admin')
         print("Admin password initialized")
 
-    # Initialize authentication mode if it doesn't exist (default: local)
     if not Settings.get_value('AUTH_MODE', None):
         Settings.set_value('AUTH_MODE', 'local')
         print("Authentication mode initialized to: local (username/password)")
 
-    # Initialize sync/reconciliation settings if they don't exist
-    _sync_defaults = {
-        'RECONCILE_THRESHOLD':       '300',
-        'RECONCILE_ACTIVE_INTERVAL': '120',
-        'RECONCILE_IDLE_INTERVAL':   '180',
-        'SKIP_ACTIVE_HOST':          'true',
-    }
-    for _key, _val in _sync_defaults.items():
-        if Settings.get_value(_key) is None:
-            Settings.set_value(_key, _val)
-    print("Sync settings initialized")
-
-    # Start background tasks automatically
-    task_manager.start()
-    print("Background tasks started automatically")
+    sync_manager.start()
+    print("Sync loop started automatically")
 
 if __name__ == '__main__':
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'

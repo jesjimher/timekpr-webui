@@ -30,7 +30,7 @@
             <div class="dashboard-controls">
                 <div class="task-status-container">
                     <span class="status-indicator" id="task-status-indicator">Unknown</span>
-                    <a href="{{ url_for('restart_tasks') }}" class="btn btn-sm btn-secondary btn-icon" title="Restart Background Tasks">
+                    <a href="{{ url_for('restart_tasks') }}" class="btn btn-sm btn-secondary btn-icon" title="Restart Sync Loop">
                         <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
                             <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
                             <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
@@ -42,17 +42,15 @@
                 <a href="{{ url_for('logout') }}" class="btn btn-sm btn-danger">Logout</a>
             </div>
         </header>
-        
+
         <script>
-            // Function to update the task status indicator
             function updateTaskStatus() {
-                fetch('/api/task-status')
+                fetch('/api/status')
                     .then(response => response.json())
                     .then(data => {
                         if (data.success) {
                             const indicator = document.getElementById('task-status-indicator');
-                            const status = data.status;
-                            
+                            const status = data.sync;
                             if (status.running && status.thread_alive) {
                                 indicator.className = 'status-active';
                                 indicator.textContent = 'Active';
@@ -60,28 +58,21 @@
                                 indicator.className = 'status-inactive';
                                 indicator.textContent = 'Inactive';
                             }
-                            
-                            // Set tooltip to show last error if any
-                            if (status.last_error) {
-                                indicator.title = `Last error: ${status.last_error.message} at ${status.last_error.time}`;
-                            } else {
-                                indicator.title = 'Background tasks are running normally';
-                            }
+                            indicator.title = status.last_error
+                                ? `Last error: ${status.last_error.message} at ${status.last_error.time}`
+                                : 'Sync loop is running normally';
                         }
                     })
                     .catch(error => {
-                        console.error('Error fetching task status:', error);
                         const indicator = document.getElementById('task-status-indicator');
                         indicator.className = 'status-error';
                         indicator.textContent = 'Error';
                     });
             }
-            
-            // Check status immediately and then every 30 seconds
             updateTaskStatus();
             setInterval(updateTaskStatus, 30000);
         </script>
-        
+
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
                 {% for category, message in messages %}
@@ -102,12 +93,15 @@
                 {% endfor %}
             {% endif %}
         {% endwith %}
-        
+
         <div class="users-grid" style="grid-template-columns: 1fr;">
             <div class="card">
                 <div class="card-header">
-                    <h2>Add New User</h2>
-                    <p style="margin: 0; color: var(--text-tertiary); font-size: var(--font-size-sm);">Add a new user to monitor and manage across your network</p>
+                    <h2>Add User / Host</h2>
+                    <p style="margin: 0; color: var(--text-tertiary); font-size: var(--font-size-sm);">
+                        An existing username gets a new host added to it, keeping the same schedule.
+                        A new username starts with no schedule configured.
+                    </p>
                 </div>
                 <div class="card-body">
                     <form action="{{ url_for('add_user') }}" method="POST">
@@ -125,18 +119,18 @@
                                     <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
                                         <path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/>
                                     </svg>
-                                    Add User
+                                    Add
                                 </button>
                             </div>
                         </div>
                     </form>
                 </div>
             </div>
-            
+
             <div class="card">
                 <div class="card-header">
                     <h2>Managed Users</h2>
-                    <p style="margin: 0; color: var(--text-tertiary); font-size: var(--font-size-sm);">Monitor and control all users across your network</p>
+                    <p style="margin: 0; color: var(--text-tertiary); font-size: var(--font-size-sm);">Every host each user is managed on, across your network</p>
                 </div>
                 <div class="card-body">
                     {% if users %}
@@ -148,17 +142,18 @@
                                         <th style="padding: var(--space-4); text-align: left; font-weight: 600; color: var(--text-primary);">System IP</th>
                                         <th style="padding: var(--space-4); text-align: left; font-weight: 600; color: var(--text-primary);">Status</th>
                                         <th style="padding: var(--space-4); text-align: left; font-weight: 600; color: var(--text-primary);">Added On</th>
-                                        <th style="padding: var(--space-4); text-align: left; font-weight: 600; color: var(--text-primary);">Last Checked</th>
+                                        <th style="padding: var(--space-4); text-align: left; font-weight: 600; color: var(--text-primary);">Last Synced</th>
                                         <th style="padding: var(--space-4); text-align: left; font-weight: 600; color: var(--text-primary);">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {% for user in users %}
+                                        {% for account in user.accounts %}
                                         <tr style="border-bottom: 1px solid var(--border-primary); transition: background-color var(--transition-fast);" onmouseover="this.style.backgroundColor='var(--bg-tertiary)'" onmouseout="this.style.backgroundColor='transparent'">
                                             <td style="padding: var(--space-4); font-weight: 500;">{{ user.username }}</td>
-                                            <td style="padding: var(--space-4); color: var(--text-secondary); font-family: monospace;">{{ user.system_ip }}</td>
+                                            <td style="padding: var(--space-4); color: var(--text-secondary); font-family: monospace;">{{ account.host.ip }}</td>
                                             <td style="padding: var(--space-4);">
-                                                {% if user.is_valid %}
+                                                {% if account.is_valid %}
                                                     <span class="badge badge-success">
                                                         <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                                             <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.061L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/>
@@ -173,24 +168,27 @@
                                                         Invalid
                                                     </span>
                                                 {% endif %}
+                                                {% if account.last_error %}
+                                                    <div style="color: var(--text-tertiary); font-size: var(--font-size-xs); margin-top: var(--space-1);" title="{{ account.last_error }}">{{ account.last_error[:60] }}</div>
+                                                {% endif %}
                                             </td>
-                                            <td style="padding: var(--space-4); color: var(--text-secondary); font-size: var(--font-size-xs);">{{ (user.date_added|localtime).strftime('%Y-%m-%d %H:%M') }}</td>
+                                            <td style="padding: var(--space-4); color: var(--text-secondary); font-size: var(--font-size-xs);">{{ (account.date_added|localtime).strftime('%Y-%m-%d %H:%M') if account.date_added else '—' }}</td>
                                             <td style="padding: var(--space-4); color: var(--text-secondary); font-size: var(--font-size-xs);">
-                                                {% if user.last_checked %}
-                                                    {{ (user.last_checked|localtime).strftime('%Y-%m-%d %H:%M') }}
+                                                {% if account.last_synced %}
+                                                    {{ (account.last_synced|localtime).strftime('%Y-%m-%d %H:%M') }}
                                                 {% else %}
                                                     <span style="color: var(--text-muted);">Never</span>
                                                 {% endif %}
                                             </td>
                                             <td style="padding: var(--space-4);">
                                                 <div style="display: flex; gap: var(--space-2);">
-                                                    <a href="{{ url_for('validate_user', user_id=user.id) }}" class="btn btn-sm btn-secondary">
+                                                    <a href="{{ url_for('validate_user', account_id=account.id) }}" class="btn btn-sm btn-secondary">
                                                         <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                                             <path d="M10.067.87a2.89 2.89 0 0 0-4.134 0l-.622.638-.89-.011a2.89 2.89 0 0 0-2.924 2.924l.01.89-.636.622a2.89 2.89 0 0 0 0 4.134l.637.622-.011.89a2.89 2.89 0 0 0 2.924 2.924l.89-.01.622.636a2.89 2.89 0 0 0 4.134 0l.622-.637.89.011a2.89 2.89 0 0 0 2.924-2.924l-.01-.89.636-.622a2.89 2.89 0 0 0 0-4.134l-.637-.622.011-.89a2.89 2.89 0 0 0-2.924-2.924l-.89.01-.622-.636zm.287 5.984-3 3a.5.5 0 0 1-.708 0l-1.5-1.5a.5.5 0 1 1 .708-.708L7 8.793l2.646-2.647a.5.5 0 0 1 .708.708z"/>
                                                         </svg>
                                                         Validate
                                                     </a>
-                                                    <form action="{{ url_for('delete_user', user_id=user.id) }}" method="POST" style="display: inline;" onsubmit="return confirm('Are you sure you want to delete this user?')">
+                                                    <form action="{{ url_for('delete_user', account_id=account.id) }}" method="POST" style="display: inline;" onsubmit="return confirm('Remove {{ user.username|e }} from {{ account.host.ip }}?')">
                                                         <button type="submit" class="btn btn-sm btn-danger">
                                                             <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
                                                                 <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
@@ -202,6 +200,7 @@
                                                 </div>
                                             </td>
                                         </tr>
+                                        {% endfor %}
                                     {% endfor %}
                                 </tbody>
                             </table>
