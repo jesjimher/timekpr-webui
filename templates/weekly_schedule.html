@@ -78,20 +78,20 @@
         .schedule-header-row {
             background: var(--bg-secondary);
             border-bottom: 2px solid var(--border-primary);
-            padding: var(--space-4) var(--space-6);
+            padding: var(--space-1) var(--space-4);
             display: grid;
-            grid-template-columns: 120px 1fr 1fr;
-            gap: var(--space-4);
+            grid-template-columns: 100px minmax(200px, 240px) 1fr;
+            gap: var(--space-3);
             align-items: center;
             font-weight: 600;
             color: var(--text-primary);
         }
 
         .schedule-row {
-            padding: var(--space-4) var(--space-6);
+            padding: var(--space-1) var(--space-4);
             display: grid;
-            grid-template-columns: 120px 1fr 1fr;
-            gap: var(--space-4);
+            grid-template-columns: 100px minmax(200px, 240px) 1fr;
+            gap: var(--space-3);
             align-items: center;
             border-bottom: 1px solid var(--border-primary);
             transition: background-color var(--transition-fast);
@@ -104,11 +104,11 @@
         .weekend .day-name { color: var(--warning); }
 
         .time-section { display: flex; align-items: center; gap: var(--space-3); }
-        .time-controls { display: flex; align-items: center; gap: var(--space-2); }
+        .time-controls { display: flex; align-items: center; gap: var(--space-2); margin: 0; flex-wrap: nowrap; }
 
         .time-input {
             width: 80px;
-            padding: var(--space-2) var(--space-3);
+            padding: var(--space-1) var(--space-2);
             border: 1px solid var(--border-primary);
             border-radius: var(--radius-md);
             background: var(--bg-primary);
@@ -124,8 +124,8 @@
         }
 
         .time-btn {
-            width: 32px;
-            height: 32px;
+            width: 28px;
+            height: 28px;
             border: 1px solid var(--border-primary);
             background: var(--bg-elevated);
             color: var(--text-primary);
@@ -142,7 +142,7 @@
 
         .time-unit { font-size: var(--font-size-sm); color: var(--text-tertiary); min-width: 40px; }
 
-        .time-display { display: inline-flex; align-items: center; justify-content: center; user-select: none; }
+        .time-display { display: inline-flex; align-items: center; justify-content: center; user-select: none; white-space: nowrap; }
 
         .interval-controls { display: flex; align-items: center; gap: var(--space-3); }
         .interval-toggle { display: flex; align-items: center; gap: var(--space-2); }
