@@ -228,11 +228,23 @@ class SyncManager:
                 self._converge_config(user, account, config)
                 # Changing the daily budget can make the host recompute its
                 # own remaining-time counter as a side effect, so the reading
-                # captured above is no longer trustworthy for step B below --
-                # skip this account for the pool step this cycle rather than
-                # push a correction based on a value that's about to be
-                # stale, which would just get undone (and redone) next cycle.
-                fresh_this_cycle.discard(account.id)
+                # captured above is no longer trustworthy for step B below.
+                # Re-read once, right after the write it follows, instead of
+                # either trusting a stale value or deferring the pool
+                # correction a full cycle (up to 60s) after every schedule
+                # edit -- that deferral is what made saving a schedule feel
+                # slow even with the immediate on-demand sync in place.
+                try:
+                    with SSHClient(hostname=ip) as ssh:
+                        is_valid, _, fresh_config = ssh.validate_user(user.username)
+                    if is_valid and fresh_config:
+                        account.last_config = json.dumps(fresh_config)
+                        account.last_synced = datetime.utcnow()
+                    else:
+                        fresh_this_cycle.discard(account.id)
+                except Exception as e:
+                    logger.warning("Post-config re-read failed for %s@%s: %s", user.username, ip, e)
+                    fresh_this_cycle.discard(account.id)
             db.session.commit()
 
         # B) time left -- only hosts that were read successfully this cycle
