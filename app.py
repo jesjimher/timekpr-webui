@@ -83,6 +83,9 @@ def _format_hm(seconds):
     return f"{h}h {rem // 60}m"
 
 
+app.jinja_env.filters['hm'] = _format_hm
+
+
 # ---------------------------------------------------------------- auth
 
 @app.route('/', methods=['GET', 'POST'])
@@ -379,7 +382,7 @@ def update_weekly_schedule():
     db.session.commit()
     sync_manager.sync_now(username)
     flash(f'Weekly schedule updated for {username}', 'success')
-    return redirect(url_for('weekly_schedule', username=username))
+    return redirect(url_for('dashboard'))
 
 
 # ---------------------------------------------------------------- history

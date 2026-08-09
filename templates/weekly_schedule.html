@@ -142,6 +142,8 @@
 
         .time-unit { font-size: var(--font-size-sm); color: var(--text-tertiary); min-width: 40px; }
 
+        .time-display { display: inline-flex; align-items: center; justify-content: center; user-select: none; }
+
         .interval-controls { display: flex; align-items: center; gap: var(--space-3); }
         .interval-toggle { display: flex; align-items: center; gap: var(--space-2); }
         .interval-toggle input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent-primary); }
@@ -230,19 +232,19 @@
 
                 {% set mon_fri = [day_limits[1], day_limits[2], day_limits[3], day_limits[4], day_limits[5]] %}
                 {% set sat_sun = [day_limits[6], day_limits[7]] %}
-                {% set total_week = mon_fri | sum(attribute='limit_seconds') / 3600.0 %}
-                {% set total_weekend = sat_sun | sum(attribute='limit_seconds') / 3600.0 %}
+                {% set total_week_seconds = mon_fri | sum(attribute='limit_seconds') %}
+                {% set total_weekend_seconds = sat_sun | sum(attribute='limit_seconds') %}
                 <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: var(--space-4); margin-bottom: var(--space-4);">
                     <div style="text-align: center; padding: var(--space-3); background: var(--bg-secondary); border-radius: var(--radius-md);">
-                        <div style="font-size: var(--font-size-2xl); font-weight: 700; color: var(--accent-primary);">{{ (total_week + total_weekend) | round(2) }}h</div>
+                        <div style="font-size: var(--font-size-2xl); font-weight: 700; color: var(--accent-primary);">{{ (total_week_seconds + total_weekend_seconds) | hm }}</div>
                         <div style="font-size: var(--font-size-sm); color: var(--text-tertiary);">Total per week</div>
                     </div>
                     <div style="text-align: center; padding: var(--space-3); background: var(--bg-secondary); border-radius: var(--radius-md);">
-                        <div style="font-size: var(--font-size-xl); font-weight: 600; color: var(--text-primary);">{{ total_week | round(2) }}h</div>
+                        <div style="font-size: var(--font-size-xl); font-weight: 600; color: var(--text-primary);">{{ total_week_seconds | hm }}</div>
                         <div style="font-size: var(--font-size-sm); color: var(--text-tertiary);">Weekdays (Mon-Fri)</div>
                     </div>
                     <div style="text-align: center; padding: var(--space-3); background: var(--bg-secondary); border-radius: var(--radius-md);">
-                        <div style="font-size: var(--font-size-xl); font-weight: 600; color: var(--warning);">{{ total_weekend | round(2) }}h</div>
+                        <div style="font-size: var(--font-size-xl); font-weight: 600; color: var(--warning);">{{ total_weekend_seconds | hm }}</div>
                         <div style="font-size: var(--font-size-sm); color: var(--text-tertiary);">Weekend (Sat-Sun)</div>
                     </div>
                 </div>
@@ -253,7 +255,8 @@
                     <span class="quick-label">Quick set hours:</span>
                     <div class="quick-stepper">
                         <button type="button" class="btn btn-sm btn-ghost" onclick="adjustBulkTime(-0.25)">-15min</button>
-                        <input type="number" id="bulk-hours" min="0" max="24" step="0.25" placeholder="2.5" class="quick-input">
+                        <input type="hidden" id="bulk-hours" value="0">
+                        <span id="bulk-hours-display" class="time-input time-display">0h 0m</span>
                         <button type="button" class="btn btn-sm btn-ghost" onclick="adjustBulkTime(0.25)">+15min</button>
                     </div>
                     <div class="quick-actions">
@@ -309,15 +312,13 @@
                         <div class="time-section">
                             <div class="time-controls">
                                 <button type="button" class="time-btn" onclick="adjustTime({{ day_num }}, -0.25)">−</button>
-                                <input type="number"
+                                <input type="hidden"
                                        id="hours-{{ day_num }}"
                                        name="hours_{{ day_num }}"
-                                       min="0" max="24" step="0.25"
-                                       value="{{ (dl.limit_seconds / 3600.0) | round(2) }}"
-                                       class="time-input">
+                                       value="{{ (dl.limit_seconds / 3600.0) | round(2) }}">
+                                <span id="hours-display-{{ day_num }}" class="time-input time-display">{{ dl.limit_seconds | hm }}</span>
                                 <button type="button" class="time-btn" onclick="adjustTime({{ day_num }}, 0.25)">+</button>
                             </div>
-                            <span class="time-unit">hours</span>
                         </div>
 
                         <div class="time-section">
@@ -366,26 +367,35 @@
                 </div>
             </form>
             <p style="color: var(--text-tertiary); font-size: var(--font-size-sm); text-align: center; margin-top: var(--space-4);">
-                Applies to every host of {{ user.username }} within about a minute of the next sync cycle.
+                Applies to every host of {{ user.username }} within a few seconds of saving.
             </p>
         </div>
     </div>
 
     <script>
+        function formatHM(hours) {
+            const totalMinutes = Math.round(hours * 60);
+            return Math.floor(totalMinutes / 60) + 'h ' + (totalMinutes % 60) + 'm';
+        }
+
         function adjustTime(day, change) {
             const input = document.getElementById('hours-' + day);
             input.value = Math.max(0, Math.min(24, (parseFloat(input.value) || 0) + change));
+            document.getElementById('hours-display-' + day).textContent = formatHM(input.value);
         }
 
         function adjustBulkTime(change) {
             const input = document.getElementById('bulk-hours');
             input.value = Math.max(0, Math.min(24, (parseFloat(input.value) || 0) + change));
+            document.getElementById('bulk-hours-display').textContent = formatHM(input.value);
         }
 
         function setDaysHours(days) {
             const h = document.getElementById('bulk-hours').value;
-            if (!h) return;
-            days.forEach(d => { document.getElementById('hours-' + d).value = h; });
+            days.forEach(d => {
+                document.getElementById('hours-' + d).value = h;
+                document.getElementById('hours-display-' + d).textContent = formatHM(h);
+            });
         }
         function setWeekdays() { setDaysHours([1,2,3,4,5]); }
         function setWeekends() { setDaysHours([6,7]); }
