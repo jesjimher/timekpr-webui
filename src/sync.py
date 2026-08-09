@@ -204,6 +204,13 @@ class SyncManager:
                     account.drift_since = now
                 logger.info("Config mismatch %s@%s: %s", user.username, ip, detail)
                 self._converge_config(user, account, config)
+                # Changing the daily budget can make the host recompute its
+                # own remaining-time counter as a side effect, so the reading
+                # captured above is no longer trustworthy for step B below --
+                # skip this account for the pool step this cycle rather than
+                # push a correction based on a value that's about to be
+                # stale, which would just get undone (and redone) next cycle.
+                fresh_this_cycle.discard(account.id)
             db.session.commit()
 
         # B) time left -- only hosts that were read successfully this cycle

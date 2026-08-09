@@ -163,6 +163,19 @@ def dashboard():
         # its own number, since it mostly restates global_time_left above.
         pool_target = user.pool_target_seconds()
 
+        # Breakdown shown in parentheses next to the total: schedule limit
+        # for today plus/minus any manual adjustment. This is locally
+        # computed intent, not the ground truth itself (global_time_left
+        # above stays host-reported per Invariant 2) -- it's just context so
+        # a parent can see *why* the total is what it is instead of only
+        # getting an unexplained "adjustment active" badge.
+        today_limit = user.today_limit_seconds()
+        bonus_seconds = user.today_bonus_seconds()
+        time_left_detail = None
+        if bonus_seconds and today_limit is not None:
+            sign = '+' if bonus_seconds > 0 else '-'
+            time_left_detail = f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}"
+
         # Only a genuine, persistent mismatch on a reachable host is an alarm.
         # A host that's merely offline is normal -- it catches up once it's
         # back on -- and must not read as "something is wrong".
@@ -188,9 +201,9 @@ def dashboard():
             'per_host_values': per_host_values,
             'remaining_today_hours': (pool_target / 3600.0) if pool_target is not None else 0.0,
             'global_time_left': global_time_left,
+            'time_left_detail': time_left_detail,
             'verification': verification,
             'drift_details': drift_details,
-            'has_bonus': user.today_bonus_seconds() != 0,
         })
 
     any_alarm = any(g['verification'] == 'drift' for g in groups)
@@ -452,10 +465,19 @@ def api_status():
         left_values = [v for v in (a.time_left() for a in fresh) if v is not None]
         time_left = min(left_values) if left_values else None
 
+        # Breakdown shown in parentheses next to the total -- see dashboard() above.
+        today_limit = user.today_limit_seconds()
+        bonus_seconds = user.today_bonus_seconds()
+        time_left_detail = None
+        if bonus_seconds and today_limit is not None:
+            sign = '+' if bonus_seconds > 0 else '-'
+            time_left_detail = f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}"
+
         users_payload[user.username] = {
             'verification': verification,
             'drift_details': drift_details,
             'time_left_str': _format_hm(time_left) if time_left is not None else 'Unknown',
+            'time_left_detail': time_left_detail,
             'accounts': {
                 a.id: {
                     'ip': a.host.ip,

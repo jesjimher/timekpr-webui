@@ -683,6 +683,13 @@ p {
   color: var(--text-tertiary);
 }
 
+.stat-value-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .stat-sub-danger {
   color: var(--danger);
   font-weight: 600;
