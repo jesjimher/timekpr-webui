@@ -224,16 +224,6 @@
                                     <div class="stat-value{{ ' stat-value-danger' if group.verification == 'drift' else '' }}"
                                          id="time-left-{{ loop.index0 }}">{{ group.global_time_left }}</div>
                                 </div>
-                                <div class="stat-item">
-                                    <div class="stat-label">Last Updated</div>
-                                    <div class="stat-value">
-                                        {% if group.last_checked %}
-                                            <span title="{{ (group.last_checked|localtime).strftime('%d/%m/%Y %H:%M') }}"{% if group.last_checked %} data-synced-utc="{{ group.last_checked.isoformat() }}Z"{% endif %}>{{ group.last_checked|synctime }}</span>
-                                        {% else %}
-                                            Never
-                                        {% endif %}
-                                    </div>
-                                </div>
                             </div>
 
                             {% if group.has_bonus %}

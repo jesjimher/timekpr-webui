@@ -151,9 +151,6 @@ def dashboard():
         # its own number, since it mostly restates global_time_left above.
         pool_target = user.pool_target_seconds()
 
-        read_times = [a.last_synced for a in accounts if a.last_synced]
-        last_checked = max(read_times) if read_times else None
-
         # Only a genuine, persistent mismatch on a reachable host is an alarm.
         # A host that's merely offline is normal -- it catches up once it's
         # back on -- and must not read as "something is wrong".
@@ -181,7 +178,6 @@ def dashboard():
             'global_time_left': global_time_left,
             'verification': verification,
             'drift_details': drift_details,
-            'last_checked': last_checked,
             'has_bonus': user.today_bonus_seconds() != 0,
         })
 
