@@ -31,9 +31,6 @@ class FakeSSHClient:
     def validate_user(self, username):
         return True, 'ok', dict(FakeSSHClient.configs[self.hostname])
 
-    def is_user_logged_in(self, username):
-        return False
-
     def modify_time_left(self, username, operation, seconds):
         FakeSSHClient.calls.append(('modify_time_left', self.hostname, operation, seconds))
         return True, 'ok'

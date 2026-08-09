@@ -29,7 +29,7 @@ from datetime import datetime, date, timedelta
 
 from src.models import (
     db, User, Usage, Settings,
-    coerce_time_spent_day, config_mismatch_detail,
+    coerce_int, coerce_time_spent_day, config_mismatch_detail,
 )
 from src.timekpr import SSHClient
 
@@ -58,7 +58,7 @@ class SyncManager:
         self.last_error = None
         self.last_cycle_at = None
         self._host_backoff: dict = {}   # {ip: {'failures': int, 'last_attempt': datetime}}
-        self._logged_in: dict = {}      # {account_id: bool} -- display only, see is_user_logged_in
+        self._active: dict = {}         # {account_id: bool} -- display only, see _sync_user
 
     def init_app(self, app):
         self.app = app
@@ -94,9 +94,10 @@ class SyncManager:
         """Host IPs currently in SSH backoff."""
         return set(self._host_backoff.keys())
 
-    def get_logged_in_accounts(self):
-        """Account ids where `who` last reported an active session."""
-        return {aid for aid, v in self._logged_in.items() if v}
+    def get_active_accounts(self):
+        """Account ids whose time left dropped on the last read -- i.e. where
+        someone is actually using the computer right now, not just logged in."""
+        return {aid for aid, v in self._active.items() if v}
 
     # ------------------------------------------------------------------ backoff
 
@@ -146,10 +147,13 @@ class SyncManager:
             if not self._host_ready(ip):
                 continue
 
+            # Captured before this read overwrites last_config -- comparing
+            # against it is how "in use" is decided below (see _active dict).
+            previous_time_left = account.time_left()
+
             try:
                 with SSHClient(hostname=ip) as ssh:
                     is_valid, message, config = ssh.validate_user(user.username)
-                    logged_in = ssh.is_user_logged_in(user.username)
                 self._record_success(ip)
             except Exception as e:
                 logger.warning("Read failed for %s@%s: %s", user.username, ip, e)
@@ -158,8 +162,6 @@ class SyncManager:
                 db.session.commit()
                 any_unreadable = True
                 continue
-
-            self._logged_in[account.id] = logged_in
 
             if not is_valid or not config:
                 account.last_error = message
@@ -172,6 +174,17 @@ class SyncManager:
             account.last_synced = now
             account.last_error = None
             fresh_this_cycle.add(account.id)
+
+            # "In use" means time is actually being spent right now, not that
+            # a session is merely open (a locked/idle session stays logged in
+            # for hours without that meaning anything). A drop in TIME_LEFT_DAY
+            # since the last read is what timekpr itself only does while the
+            # user is active, so it's the one signal that means what it says.
+            current_time_left = coerce_int(config.get('TIME_LEFT_DAY'))
+            self._active[account.id] = (
+                previous_time_left is not None and current_time_left is not None
+                and current_time_left < previous_time_left
+            )
 
             today = date.today()
             seconds = coerce_time_spent_day(config.get('TIME_SPENT_DAY', 0))

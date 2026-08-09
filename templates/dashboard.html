@@ -32,11 +32,9 @@
         </header>
 
         <script>
-            const warnIconPath = 'M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z';
-
             // Everything the dashboard needs to stay live comes from a single
-            // endpoint -- host status, verification state, time-left headline,
-            // pool remaining. All DB reads server-side, no extra host traffic.
+            // endpoint -- host status, verification state, time-left headline.
+            // All DB reads server-side, no extra host traffic.
             const GROUP_INDEX = {{ groups | map(attribute='username') | list | tojson }};
 
             function fmtHM(s) {
@@ -87,40 +85,27 @@
                                 }
                             });
 
-                            // Verification badge + alarm state.
-                            const worst = info.verification;
+                            // Verification badge + alarm state. Only a genuine
+                            // mismatch on a reachable host is worth flagging --
+                            // an offline host is normal and shown by its dot
+                            // above, not by an extra alarm here.
+                            const isDrift = info.verification === 'drift';
                             const badge = document.getElementById('sync-status-' + groupIdx);
-                            const syncText = document.getElementById('sync-text-' + groupIdx);
-                            const syncIcon = document.getElementById('sync-icon-' + groupIdx);
                             if (badge) {
-                                if (worst === 'drift' || worst === 'unverified') {
-                                    badge.className = 'badge badge-danger sync-status-badge';
-                                    badge.style.display = 'block';
-                                    badge.title = info.drift_details.join('\n');
-                                    syncText.textContent = worst === 'drift' ? 'NOT ENFORCED' : 'Limit unverified';
-                                    syncIcon.setAttribute('d', warnIconPath);
-                                } else {
-                                    badge.style.display = 'none';
-                                }
+                                badge.style.display = isDrift ? 'block' : 'none';
+                                if (isDrift) badge.title = info.drift_details.join('\n');
                             }
 
-                            // "Time Left Today" + pool sub-line, refreshed from ground truth.
                             const timeLeftEl = document.getElementById('time-left-' + groupIdx);
                             if (timeLeftEl) {
                                 timeLeftEl.textContent = info.time_left_str;
-                                timeLeftEl.classList.toggle('stat-value-danger', worst === 'drift' || worst === 'unverified');
-                            }
-                            const poolEl = document.getElementById('pool-remaining-' + groupIdx);
-                            if (poolEl && info.pool_remaining_str) {
-                                poolEl.textContent = 'Budget left (pool): ' + info.pool_remaining_str;
+                                timeLeftEl.classList.toggle('stat-value-danger', isDrift);
                             }
 
-                            if (worst === 'drift' || worst === 'unverified') {
+                            if (isDrift) {
                                 anyAlarm = true;
                                 let item = list ? list.querySelector('[data-alarm-group="' + groupIdx + '"]') : null;
-                                const text = worst === 'drift'
-                                    ? 'NOT ENFORCED' + (info.drift_details.length ? ': ' + info.drift_details.join('; ') : '')
-                                    : 'limit unverified (host unreachable or never read)';
+                                const text = 'NOT ENFORCED' + (info.drift_details.length ? ': ' + info.drift_details.join('; ') : '');
                                 if (!item && list) {
                                     item = document.createElement('li');
                                     item.dataset.alarmGroup = String(groupIdx);
@@ -208,16 +193,11 @@
         {% endwith %}
 
         <div id="alarm-banner" class="alert alert-danger" style="display: {{ 'block' if any_alarm else 'none' }};">
-            <strong>Not verifiably enforced:</strong>
+            <strong>Not enforced:</strong>
             <ul id="alarm-banner-list" style="margin: var(--space-2) 0 0; padding-left: 1.25em;">
-                {% for group in groups if group.verification in ('drift', 'unverified') %}
+                {% for group in groups if group.verification == 'drift' %}
                     <li data-alarm-group="{{ loop.index0 }}">
-                        {{ group.username }} —
-                        {% if group.verification == 'drift' %}
-                            NOT ENFORCED{% if group.drift_details %}: {{ group.drift_details | join('; ') }}{% endif %}
-                        {% else %}
-                            limit unverified{% if group.last_checked %} since {{ group.last_checked|synctime }}{% endif %} (host unreachable or never read)
-                        {% endif %}
+                        {{ group.username }} — NOT ENFORCED{% if group.drift_details %}: {{ group.drift_details | join('; ') }}{% endif %}
                     </li>
                 {% endfor %}
             </ul>
@@ -241,16 +221,8 @@
                             <div class="user-stats">
                                 <div class="stat-item">
                                     <div class="stat-label">Time Left Today</div>
-                                    <div class="stat-value{{ ' stat-value-danger' if group.verification in ('drift', 'unverified') else '' }}"
+                                    <div class="stat-value{{ ' stat-value-danger' if group.verification == 'drift' else '' }}"
                                          id="time-left-{{ loop.index0 }}">{{ group.global_time_left }}</div>
-                                    {% if group.show_limit_mismatch %}
-                                    <div class="stat-sub stat-sub-danger">
-                                        Host limit today: {{ group.enforced_limit_today_str }} — configured {{ group.configured_limit_today_str }}
-                                    </div>
-                                    {% endif %}
-                                    {% if group.is_multi_host and group.pool_remaining_str %}
-                                    <div class="stat-sub" id="pool-remaining-{{ loop.index0 }}">Budget left (pool): {{ group.pool_remaining_str }}</div>
-                                    {% endif %}
                                 </div>
                                 <div class="stat-item">
                                     <div class="stat-label">Last Updated</div>
@@ -275,18 +247,12 @@
 
                             <div id="sync-status-{{ loop.index0 }}"
                                  class="badge sync-status-badge badge-danger"
-                                 style="margin-bottom: var(--space-4); display: {{ 'block' if group.verification in ('drift', 'unverified') else 'none' }};"
+                                 style="margin-bottom: var(--space-4); display: {{ 'block' if group.verification == 'drift' else 'none' }};"
                                  {% if group.drift_details %}title="{{ group.drift_details | join('&#10;') }}"{% endif %}>
                                 <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
-                                    <path id="sync-icon-{{ loop.index0 }}" d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
+                                    <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
                                 </svg>
-                                <span id="sync-text-{{ loop.index0 }}">
-                                    {%- if group.verification == 'drift' -%}
-                                        NOT ENFORCED
-                                    {%- else -%}
-                                        Limit unverified{% if group.last_checked %} since {{ group.last_checked|synctime }}{% endif %}
-                                    {%- endif -%}
-                                </span>
+                                NOT ENFORCED
                             </div>
 
                             <div class="user-actions">

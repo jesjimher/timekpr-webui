@@ -126,7 +126,7 @@ def dashboard():
     users = [u for u in User.query.order_by(User.username).all() if u.accounts]
 
     offline = sync_manager.get_offline_hosts()
-    logged_in = sync_manager.get_logged_in_accounts()
+    active_accounts = sync_manager.get_active_accounts()
     groups = []
 
     for user in users:
@@ -147,35 +147,17 @@ def dashboard():
         enforced_time_left = max(left_values) if left_values else None
         global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Unknown"
 
-        enforced_values = [v for v in (a.enforced_today_seconds() for a in fresh_accounts) if v is not None]
-        enforced_limit_today = max(enforced_values) if enforced_values else None
-        configured_limit_today = user.today_limit_seconds()
-        show_limit_mismatch = (
-            configured_limit_today is not None and enforced_limit_today is not None
-            and configured_limit_today != enforced_limit_today
-        )
-        enforced_limit_today_str = (
-            _format_hm(enforced_limit_today) if enforced_limit_today is not None else None
-        )
-        configured_limit_today_str = (
-            "blocked" if configured_limit_today == 0
-            else _format_hm(configured_limit_today) if configured_limit_today is not None
-            else None
-        )
-
+        # Feeds only the chart's "remaining today" bar segment -- not shown as
+        # its own number, since it mostly restates global_time_left above.
         pool_target = user.pool_target_seconds()
-        pool_remaining_str = _format_hm(pool_target) if pool_target is not None else None
 
         read_times = [a.last_synced for a in accounts if a.last_synced]
         last_checked = max(read_times) if read_times else None
 
-        states = [a.verification_state() for a in accounts]
-        if 'drift' in states:
-            verification = 'drift'
-        elif 'unverified' in states:
-            verification = 'unverified'
-        else:
-            verification = 'ok'
+        # Only a genuine, persistent mismatch on a reachable host is an alarm.
+        # A host that's merely offline is normal -- it catches up once it's
+        # back on -- and must not read as "something is wrong".
+        verification = 'drift' if any(a.verification_state() == 'drift' for a in accounts) else 'ok'
 
         drift_details = []
         for a in accounts:
@@ -190,25 +172,20 @@ def dashboard():
                 'id': a.id,
                 'ip': a.host.ip,
                 'offline': a.host.ip in offline,
-                'in_use': a.id in logged_in and a.host.ip not in offline,
+                'in_use': a.id in active_accounts and a.host.ip not in offline,
                 'last_synced': a.last_synced,
             } for a in accounts],
             'dates': dates or [],
             'per_host_values': per_host_values,
             'remaining_today_hours': (pool_target / 3600.0) if pool_target is not None else 0.0,
-            'pool_remaining_str': pool_remaining_str,
             'global_time_left': global_time_left,
-            'enforced_limit_today_str': enforced_limit_today_str,
-            'configured_limit_today_str': configured_limit_today_str,
-            'show_limit_mismatch': show_limit_mismatch,
             'verification': verification,
             'drift_details': drift_details,
             'last_checked': last_checked,
             'has_bonus': user.today_bonus_seconds() != 0,
-            'is_multi_host': len(accounts) > 1,
         })
 
-    any_alarm = any(g['verification'] in ('drift', 'unverified') for g in groups)
+    any_alarm = any(g['verification'] == 'drift' for g in groups)
     return render_template('dashboard.html', groups=groups, any_alarm=any_alarm)
 
 
@@ -442,7 +419,7 @@ def adjust_time(username):
 @login_required
 def api_status():
     offline = sync_manager.get_offline_hosts()
-    logged_in = sync_manager.get_logged_in_accounts()
+    active_accounts = sync_manager.get_active_accounts()
 
     users_payload = {}
     for user in User.query.all():
@@ -450,13 +427,10 @@ def api_status():
         if not accounts:
             continue
 
-        states = [a.verification_state() for a in accounts]
-        if 'drift' in states:
-            verification = 'drift'
-        elif 'unverified' in states:
-            verification = 'unverified'
-        else:
-            verification = 'ok'
+        # Only a genuine, persistent mismatch on a reachable host counts as an
+        # alarm. A host that's merely offline/unreachable is normal (it'll
+        # catch up once it's back) and must not read as "something is wrong".
+        verification = 'drift' if any(a.verification_state() == 'drift' for a in accounts) else 'ok'
 
         drift_details = []
         for a in accounts:
@@ -468,18 +442,16 @@ def api_status():
         fresh = [a for a in accounts if not a.is_stale()]
         left_values = [v for v in (a.time_left() for a in fresh) if v is not None]
         time_left = max(left_values) if left_values else None
-        pool_target = user.pool_target_seconds()
 
         users_payload[user.username] = {
             'verification': verification,
             'drift_details': drift_details,
             'time_left_str': _format_hm(time_left) if time_left is not None else 'Unknown',
-            'pool_remaining_str': _format_hm(pool_target) if pool_target is not None else None,
             'accounts': {
                 a.id: {
                     'ip': a.host.ip,
                     'offline': a.host.ip in offline,
-                    'in_use': a.id in logged_in and a.host.ip not in offline,
+                    'in_use': a.id in active_accounts and a.host.ip not in offline,
                     'last_synced_iso': a.last_synced.isoformat() + 'Z' if a.last_synced else None,
                     'last_error': a.last_error,
                 } for a in accounts
