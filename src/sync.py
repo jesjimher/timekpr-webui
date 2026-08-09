@@ -82,6 +82,28 @@ class SyncManager:
         time.sleep(1)
         self.start()
 
+    def sync_now(self, username):
+        """Run one sync pass for a single user immediately, off the periodic
+        clock. Used right after an edit (schedule save, time adjustment) so
+        the dashboard doesn't sit on a stale host reading for up to a full
+        READ_INTERVAL before the change is visible -- without this, the
+        parent has no way to tell a slow-to-converge edit apart from one
+        that silently failed."""
+        if not self.app:
+            return
+
+        def _run():
+            try:
+                with self.app.app_context():
+                    threshold = Settings.get_int('PROPAGATION_THRESHOLD', self.PROPAGATION_THRESHOLD_DEFAULT)
+                    user = User.query.filter_by(username=username).first()
+                    if user:
+                        self._sync_user(user, threshold)
+            except Exception:
+                logger.exception("On-demand sync failed for %s", username)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def get_status(self):
         return {
             'running': self.running,

@@ -377,6 +377,7 @@ def update_weekly_schedule():
         a.drift_since = None
 
     db.session.commit()
+    sync_manager.sync_now(username)
     flash(f'Weekly schedule updated for {username}', 'success')
     return redirect(url_for('weekly_schedule', username=username))
 
@@ -424,12 +425,13 @@ def adjust_time(username):
     bonus = user.add_bonus(signed)
     total_min = bonus.seconds // 60
     sign_str = '+' if total_min >= 0 else ''
+    sync_manager.sync_now(username)
 
     return jsonify({
         'success': True,
         'message': (f"Adjusted {operation}{seconds // 60}m "
                     f"(total today: {sign_str}{total_min}m). "
-                    "Applies to every host within about a minute."),
+                    "Applying to every host now."),
         'refresh': True,
     })
 
