@@ -204,10 +204,33 @@
             color: var(--text-primary);
             font-size: var(--font-size-sm);
         }
-        
+
         .time-select:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+        }
+
+        .time-input-clock {
+            padding: var(--space-1) var(--space-2);
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius-sm);
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            font-size: var(--font-size-sm);
+            cursor: pointer;
+        }
+
+        .time-input-clock:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        [data-theme="dark"] .time-input-clock {
+            color-scheme: dark;
+        }
+
+        [data-theme="light"] .time-input-clock {
+            color-scheme: light;
         }
         
         .actions-section {
@@ -271,7 +294,7 @@
                 justify-content: flex-end;
             }
 
-            .interval-time .time-select {
+            .interval-time .time-input-clock {
                 flex: 1;
                 min-width: 0;
                 max-width: 120px;
@@ -297,7 +320,7 @@
                 justify-content: center;
             }
 
-            .quick-stepper .time-select {
+            .quick-stepper .time-input-clock {
                 flex: 1;
                 min-width: 0;
             }
@@ -408,18 +431,9 @@
                 <div class="quick-control">
                     <span class="quick-label">Quick set interval:</span>
                     <div class="quick-stepper">
-                        <select id="bulk-start" class="time-select">
-                            {% for h in range(24) %}
-                            <option value="{{ h }}" {% if h == 9 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                            {% endfor %}
-                        </select>
+                        <input type="time" id="bulk-start" class="time-input-clock" value="09:00">
                         <span>to</span>
-                        <select id="bulk-end" class="time-select">
-                            {% for h in range(1, 24) %}
-                            <option value="{{ h }}" {% if h == 17 %}selected{% endif %}>{{ '%02d:00'|format(h) }}</option>
-                            {% endfor %}
-                            <option value="24">23:59</option>
-                        </select>
+                        <input type="time" id="bulk-end" class="time-input-clock" value="17:00">
                     </div>
                     <div class="quick-actions">
                         <button type="button" class="btn btn-sm btn-secondary" onclick="setWeekdayIntervals()">Weekdays</button>
@@ -480,18 +494,9 @@
                                     <label for="interval-{{ day_num }}">Enable</label>
                                 </div>
                                 <div class="interval-time">
-                                    <select id="start-{{ day_num }}" class="time-select" disabled>
-                                        {% for h in range(24) %}
-                                        <option value="{{ h }}">{{ '%02d:00'|format(h) }}</option>
-                                        {% endfor %}
-                                    </select>
+                                    <input type="time" id="start-{{ day_num }}" class="time-input-clock" value="09:00" disabled>
                                     <span>to</span>
-                                    <select id="end-{{ day_num }}" class="time-select" disabled>
-                                        {% for h in range(1, 24) %}
-                                        <option value="{{ h }}">{{ '%02d:00'|format(h) }}</option>
-                                        {% endfor %}
-                                        <option value="24">23:59</option>
-                                    </select>
+                                    <input type="time" id="end-{{ day_num }}" class="time-input-clock" value="17:00" disabled>
                                 </div>
                             </div>
                         </div>
@@ -695,9 +700,10 @@
                             const iv = intervals[day];
                             if (iv) {
                                 document.getElementById(`interval-${day}`).checked = iv.is_enabled;
-                                document.getElementById(`start-${day}`).value = iv.start_hour;
+                                document.getElementById(`start-${day}`).value =
+                                    String(iv.start_hour).padStart(2,'0') + ':' + String(iv.start_minute || 0).padStart(2,'0');
                                 document.getElementById(`end-${day}`).value =
-                                    (iv.end_hour === 23 && iv.end_minute === 59) ? 24 : iv.end_hour;
+                                    String(iv.end_hour).padStart(2,'0') + ':' + String(iv.end_minute || 0).padStart(2,'0');
                                 toggleInterval(day);
                             }
                         }
@@ -725,21 +731,21 @@
             return new Promise((resolve, reject) => {
                 const intervalData = {};
                 for (let day = 1; day <= 7; day++) {
-                    const enabled   = document.getElementById(`interval-${day}`).checked;
-                    const startHour = parseInt(document.getElementById(`start-${day}`).value);
-                    const endHour   = parseInt(document.getElementById(`end-${day}`).value);
-                    if (enabled && startHour >= endHour) {
+                    const enabled = document.getElementById(`interval-${day}`).checked;
+                    const startVal = document.getElementById(`start-${day}`).value;
+                    const endVal   = document.getElementById(`end-${day}`).value;
+                    const [startHour, startMinute] = startVal.split(':').map(Number);
+                    const [endHour, endMinute]     = endVal.split(':').map(Number);
+                    if (enabled && (startHour * 60 + startMinute) >= (endHour * 60 + endMinute)) {
                         const msg = `Invalid range for day ${day}: start must be before end`;
                         if (showAlert) showNotification(msg, 'error');
                         reject(new Error(msg));
                         return;
                     }
-                    const endsAtMidnight = endHour === 24;
                     intervalData[day] = {
                         is_enabled: enabled,
-                        start_hour: startHour, start_minute: 0,
-                        end_hour: endsAtMidnight ? 23 : endHour,
-                        end_minute: endsAtMidnight ? 59 : 0,
+                        start_hour: startHour, start_minute: startMinute,
+                        end_hour: endHour,     end_minute: endMinute,
                     };
                 }
 
