@@ -142,9 +142,15 @@ def dashboard():
 
         # Ground truth: what the hosts themselves report. A stale account is
         # excluded so an unreachable machine can't drag a stale number in.
+        # Take the MIN, not the max, across a multi-host user's fresh accounts:
+        # they share one pool, so the lowest figure is always the freshest --
+        # an idle sibling that hasn't been corrected yet still shows the full
+        # day's budget, and picking the max would flash that stale, optimistic
+        # number instead of what the host actually in use is really counting
+        # down to.
         fresh_accounts = [a for a in accounts if not a.is_stale()]
         left_values = [v for v in (a.time_left() for a in fresh_accounts) if v is not None]
-        enforced_time_left = max(left_values) if left_values else None
+        enforced_time_left = min(left_values) if left_values else None
         global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Unknown"
 
         # Feeds only the chart's "remaining today" bar segment -- not shown as
@@ -435,9 +441,10 @@ def api_status():
                 if detail:
                     drift_details.append(f"{a.host.ip}: {detail}")
 
+        # MIN, not max -- see the same computation in dashboard() above.
         fresh = [a for a in accounts if not a.is_stale()]
         left_values = [v for v in (a.time_left() for a in fresh) if v is not None]
-        time_left = max(left_values) if left_values else None
+        time_left = min(left_values) if left_values else None
 
         users_payload[user.username] = {
             'verification': verification,
