@@ -140,15 +140,21 @@ def dashboard():
                 dates = list(usage.keys())
             per_host_values.append({'ip': a.host.ip, 'hours': [v / 3600.0 for v in usage.values()]})
 
-        # Ground truth: what the hosts themselves report. A stale account is
-        # excluded so an unreachable machine can't drag a stale number in.
-        # Take the MIN, not the max, across a multi-host user's fresh accounts:
-        # they share one pool, so the lowest figure is always the freshest --
-        # an idle sibling that hasn't been corrected yet still shows the full
+        # Ground truth: what the hosts themselves report. Excluded: a stale
+        # account (no successful read in the last 3 min) and one currently
+        # offline in the sync loop's own backoff tracking -- that second check
+        # matters because a host that *just* went offline is still "fresh" by
+        # the 3-minute clock, so without it, a machine that's now off keeps
+        # contributing its last (real, but frozen) reading to the number below
+        # even though nobody can possibly be using it right now.
+        #
+        # Take the MIN, not the max, across what's left: a multi-host user
+        # shares one pool, so the lowest figure is always the freshest -- an
+        # idle sibling that hasn't been corrected yet still shows the full
         # day's budget, and picking the max would flash that stale, optimistic
         # number instead of what the host actually in use is really counting
         # down to.
-        fresh_accounts = [a for a in accounts if not a.is_stale()]
+        fresh_accounts = [a for a in accounts if not a.is_stale() and a.host.ip not in offline]
         left_values = [v for v in (a.time_left() for a in fresh_accounts) if v is not None]
         enforced_time_left = min(left_values) if left_values else None
         global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Unknown"
@@ -441,8 +447,8 @@ def api_status():
                 if detail:
                     drift_details.append(f"{a.host.ip}: {detail}")
 
-        # MIN, not max -- see the same computation in dashboard() above.
-        fresh = [a for a in accounts if not a.is_stale()]
+        # MIN across non-stale, non-offline accounts -- see dashboard() above.
+        fresh = [a for a in accounts if not a.is_stale() and a.host.ip not in offline]
         left_values = [v for v in (a.time_left() for a in fresh) if v is not None]
         time_left = min(left_values) if left_values else None
 
