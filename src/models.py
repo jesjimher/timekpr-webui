@@ -466,6 +466,13 @@ def config_mismatch_detail(user, account):
         mismatches = [d for d in range(1, 8) if expected[d] != enforced.get(d, 0)]
         if mismatches:
             limits_detail = _format_limit_mismatches(expected, enforced, mismatches)
+        else:
+            # A day missing from ALLOWED_WEEKDAYS reads as a 0 limit above, so
+            # it looks equivalent -- but timekpr's --settimeleft needs all 7
+            # days listed (see SSHClient.set_day_limits), so it isn't.
+            host_days = {coerce_int(d) for d in config.get('ALLOWED_WEEKDAYS') or []}
+            if not set(range(1, 8)) <= host_days:
+                limits_detail = "Host weekday list incomplete (blocked days must be sent as a 0 limit)"
 
     hours_drifted_days = []
     for dl in user.day_limits:

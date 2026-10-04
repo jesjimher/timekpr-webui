@@ -229,9 +229,15 @@ class SSHClient:
             current_config = current_config or {}
             by_day = {dl.day_of_week: dl for dl in day_limits}
 
-            allowed_day_nums = [d for d in range(1, 8)
-                                 if by_day.get(d) and by_day[d].limit_seconds > 0]
-            desired_limits = {d: by_day[d].limit_seconds for d in allowed_day_nums}
+            # Every day stays in ALLOWED_WEEKDAYS; a blocked day is sent as a
+            # 0 limit instead of being left out. timekpr's --settimeleft looks
+            # up today's limit in LIMITS_PER_WEEKDAYS by Monday..Sunday
+            # position, so a shorter list makes it fail outright on the
+            # trailing weekdays (e.g. every Sunday once any day is blocked),
+            # silently dropping any bonus. A 0 limit still locks the user out.
+            allowed_day_nums = list(range(1, 8))
+            desired_limits = {d: (by_day[d].limit_seconds if by_day.get(d) else 0)
+                              for d in allowed_day_nums}
 
             # --- daily budget: --setalloweddays / --settimelimits ---
             host_days_raw = current_config.get('ALLOWED_WEEKDAYS')
@@ -247,7 +253,7 @@ class SSHClient:
 
             days_match = host_days is not None and host_days == set(allowed_day_nums)
             if not days_match:
-                days_arg = ';'.join(str(d) for d in allowed_day_nums)  # may be empty -> blocks every day
+                days_arg = ';'.join(str(d) for d in allowed_day_nums)
                 success, detail = self._exec_checked(
                     f"timekpra --setalloweddays {shlex.quote(username)} {shlex.quote(days_arg)}",
                     "Failed to set allowed days",
@@ -265,7 +271,7 @@ class SSHClient:
                     host_limits = dict(pairs)
             limits_match = host_limits is not None and host_limits == desired_limits
 
-            if desired_limits and not limits_match:
+            if not limits_match:
                 limits_arg = ';'.join(str(desired_limits[d]) for d in allowed_day_nums)
                 success, detail = self._exec_checked(
                     f"timekpra --settimelimits {shlex.quote(username)} {shlex.quote(limits_arg)}",

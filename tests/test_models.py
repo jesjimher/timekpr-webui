@@ -182,10 +182,43 @@ def test_mismatch_detail_flags_hours_mismatch(app):
     db.session.commit()
 
     a1.last_config = json.dumps({
-        'ALLOWED_WEEKDAYS': [2],
-        'LIMITS_PER_WEEKDAYS': [900],
+        'ALLOWED_WEEKDAYS': [1, 2, 3, 4, 5, 6, 7],
+        'LIMITS_PER_WEEKDAYS': [0, 900, 0, 0, 0, 0, 0],
         'ALLOWED_HOURS_2': [9, 10, 11],  # host has 9-11, we want 9-12
     })
     ok, detail = config_mismatch_detail(user, a1)
     assert ok is False
     assert 'Tue' in detail
+
+
+def _blocked_saturday_user():
+    user, h1, h2, a1, a2 = _make_user_with_two_hosts()
+    for d in range(1, 8):
+        db.session.add(DayLimit(user_id=user.id, day_of_week=d,
+                                limit_seconds=0 if d == 6 else 8100))
+    db.session.commit()
+    return user, a1
+
+
+def test_mismatch_detail_flags_blocked_day_left_out_of_weekday_list(app):
+    """A blocked day omitted from ALLOWED_WEEKDAYS reads as a 0 limit, but
+    timekpr's --settimeleft indexes LIMITS_PER_WEEKDAYS by Mon..Sun position
+    and fails on a short list -- so it must still count as a mismatch."""
+    user, a1 = _blocked_saturday_user()
+    a1.last_config = json.dumps({
+        'ALLOWED_WEEKDAYS': [1, 2, 3, 4, 5, 7],
+        'LIMITS_PER_WEEKDAYS': [8100] * 6,
+    })
+    ok, detail = config_mismatch_detail(user, a1)
+    assert ok is False
+    assert 'weekday list incomplete' in detail
+
+
+def test_mismatch_detail_ok_with_blocked_day_sent_as_zero(app):
+    user, a1 = _blocked_saturday_user()
+    a1.last_config = json.dumps({
+        'ALLOWED_WEEKDAYS': [1, 2, 3, 4, 5, 6, 7],
+        'LIMITS_PER_WEEKDAYS': [8100, 8100, 8100, 8100, 8100, 0, 8100],
+    })
+    ok, detail = config_mismatch_detail(user, a1)
+    assert ok is True and detail is None
