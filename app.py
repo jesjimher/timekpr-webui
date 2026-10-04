@@ -336,7 +336,9 @@ def weekly_schedule(username):
     user.ensure_day_limits()
     day_limits = {dl.day_of_week: dl for dl in user.day_limits}
     hosts_str = ', '.join(a.host.ip for a in user.accounts)
-    return render_template('weekly_schedule.html', user=user, day_limits=day_limits, hosts_str=hosts_str)
+    today_dow = datetime.now(LOCAL_TIMEZONE).isoweekday()
+    return render_template('weekly_schedule.html', user=user, day_limits=day_limits,
+                           hosts_str=hosts_str, today_dow=today_dow)
 
 
 @app.route('/weekly-schedule/update', methods=['POST'])

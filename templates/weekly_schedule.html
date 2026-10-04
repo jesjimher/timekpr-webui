@@ -80,7 +80,7 @@
             border-bottom: 2px solid var(--border-primary);
             padding: var(--space-1) var(--space-4);
             display: grid;
-            grid-template-columns: 100px auto 1fr;
+            grid-template-columns: 140px auto 1fr;
             gap: var(--space-12);
             align-items: center;
             font-weight: 600;
@@ -90,7 +90,7 @@
         .schedule-row {
             padding: var(--space-1) var(--space-4);
             display: grid;
-            grid-template-columns: 100px auto 1fr;
+            grid-template-columns: 140px auto 1fr;
             gap: var(--space-12);
             align-items: center;
             border-bottom: 1px solid var(--border-primary);
@@ -99,9 +99,22 @@
 
         .schedule-row:hover { background: var(--bg-secondary); }
         .schedule-row:last-child { border-bottom: none; }
+        .schedule-row.today,
+        .schedule-row.today:hover { background: color-mix(in srgb, var(--accent-primary) 14%, var(--bg-primary)); }
 
-        .day-name { font-weight: 600; color: var(--text-primary); font-size: var(--font-size-base); }
-        .weekend .day-name { color: var(--warning); }
+        .day-name {
+            justify-self: start;
+            padding: var(--space-1) var(--space-2);
+            background: var(--text-primary);
+            color: var(--bg-primary);
+            font-size: var(--font-size-base);
+            font-weight: 600;
+        }
+        .weekend .day-name { background: var(--warning); color: #fff; }
+        /* Desktop: every label as wide as the longest ("Wednesday") */
+        @media (min-width: 969px) {
+            .day-name { box-sizing: border-box; width: 6.8em; }
+        }
 
         .time-section { display: flex; align-items: center; gap: var(--space-3); }
         .time-controls { display: flex; align-items: center; gap: var(--space-2); margin: 0; flex-wrap: nowrap; }
@@ -143,6 +156,8 @@
         .time-unit { font-size: var(--font-size-sm); color: var(--text-tertiary); min-width: 40px; }
 
         .time-display { display: inline-flex; align-items: center; justify-content: center; user-select: none; white-space: nowrap; }
+        /* Fixed width that fits the widest value ("23h 45m"), so boxes never resize */
+        .time-input.time-display { width: 100px; min-width: 100px; max-width: none; flex: none; padding-left: var(--space-1); padding-right: var(--space-1); }
 
         .interval-controls { display: flex; align-items: center; gap: var(--space-3); }
         .interval-toggle { display: flex; align-items: center; gap: var(--space-2); }
@@ -186,24 +201,50 @@
 
         @media (max-width: 968px) {
             .schedule-header-row { display: none; }
-            .schedule-row { grid-template-columns: 1fr; gap: var(--space-3); }
-            .time-section {
-                justify-content: space-between;
-                padding: var(--space-3);
-                background: var(--bg-secondary);
-                border-radius: var(--radius-md);
+            /* Each day (name + limit, then interval) is set off by a solid-filled day label */
+            /* Days sit apart, with the page background showing in the gaps */
+            .schedule-table {
+                border: none;
+                background: none;
+                display: flex;
+                flex-direction: column;
+                gap: var(--space-4);
             }
-            .time-controls { flex: 1; justify-content: center; }
-            .time-controls .time-input { flex: 1; width: auto; min-width: 0; max-width: 140px; }
-            .interval-controls { flex-wrap: wrap; justify-content: space-between; width: 100%; gap: var(--space-2); }
-            .interval-time { flex: 1; justify-content: flex-end; }
-            .interval-time .time-input-clock { flex: 1; min-width: 0; max-width: 120px; }
+            .schedule-row {
+                grid-template-columns: 1fr auto;
+                grid-template-areas: "day limit" "interval interval";
+                gap: var(--space-2) var(--space-3);
+                padding: var(--space-3);
+                background: var(--bg-primary);
+                border-bottom: none;
+            }
+            .schedule-row:hover { background: var(--bg-primary); }
+            .schedule-row.today,
+            .schedule-row.today:hover { background: color-mix(in srgb, var(--accent-primary) 14%, var(--bg-primary)); }
+            .schedule-main { padding: var(--space-4) 0; }
+            .day-name { grid-area: day; }
+            .limit-section { grid-area: limit; }
+            .interval-section { grid-area: interval; }
+            .limit-section .time-controls { flex: none; }
+            .interval-controls { flex-wrap: nowrap; justify-content: space-between; width: 100%; gap: var(--space-2); }
+            .interval-toggle { font-size: var(--font-size-sm); }
+            .interval-time { gap: var(--space-1); }
+            .interval-time { min-width: 0; }
+            .interval-time .time-input-clock { padding: var(--space-1); min-width: 0; }
+            .quick-control { min-width: 0; }
+            .quick-stepper .time-input-clock { width: 0; }
             .schedule-controls { flex-direction: column; }
             .quick-control { flex-wrap: wrap; gap: var(--space-3); }
             .quick-label { width: 100%; font-size: var(--font-size-sm); font-weight: 600; }
             .quick-stepper { width: 100%; justify-content: center; }
             .quick-stepper .time-input-clock { flex: 1; min-width: 0; }
             .quick-actions { width: 100%; justify-content: space-between; }
+        }
+
+        @media (max-width: 400px) {
+            /* Tapping the field opens the picker anyway; the icon only steals width */
+            .time-input-clock::-webkit-calendar-picker-indicator { display: none; }
+            .limit-section .time-controls { gap: var(--space-1); }
         }
     </style>
 </head>
@@ -311,10 +352,10 @@
 
                     {% for day_num, day_name in days %}
                     {% set dl = day_limits[day_num] %}
-                    <div class="schedule-row {% if day_num >= 6 %}weekend{% endif %}">
+                    <div class="schedule-row {% if day_num >= 6 %}weekend{% endif %} {% if day_num == today_dow %}today{% endif %}">
                         <div class="day-name">{{ day_name }}</div>
 
-                        <div class="time-section">
+                        <div class="time-section limit-section">
                             <div class="time-controls">
                                 <button type="button" class="time-btn" onclick="adjustTime({{ day_num }}, -0.25)">−</button>
                                 <input type="hidden"
@@ -326,7 +367,7 @@
                             </div>
                         </div>
 
-                        <div class="time-section">
+                        <div class="time-section interval-section">
                             <div class="interval-controls">
                                 <div class="interval-toggle">
                                     <input type="checkbox" id="interval-{{ day_num }}"
@@ -342,7 +383,7 @@
                                            class="time-input-clock"
                                            value="{{ '%02d:%02d'|format(dl.start_hour, dl.start_minute) }}"
                                            {% if not dl.hours_enabled %}disabled{% endif %}>
-                                    <span>to</span>
+                                    <span>–</span>
                                     <input type="time"
                                            id="end-{{ day_num }}"
                                            name="end_time_{{ day_num }}"
