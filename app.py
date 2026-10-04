@@ -160,7 +160,7 @@ def dashboard():
         fresh_accounts = [a for a in accounts if not a.is_stale() and a.host.ip not in offline]
         left_values = [v for v in (a.time_left() for a in fresh_accounts) if v is not None]
         enforced_time_left = min(left_values) if left_values else None
-        global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Unknown"
+        global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Offline"
 
         # Feeds only the chart's "remaining today" bar segment -- not shown as
         # its own number, since it mostly restates global_time_left above.
@@ -482,7 +482,7 @@ def api_status():
         users_payload[user.username] = {
             'verification': verification,
             'drift_details': drift_details,
-            'time_left_str': _format_hm(time_left) if time_left is not None else 'Unknown',
+            'time_left_str': _format_hm(time_left) if time_left is not None else 'Offline',
             'time_left_detail': time_left_detail,
             'accounts': {
                 a.id: {
