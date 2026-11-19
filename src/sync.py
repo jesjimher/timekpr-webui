@@ -281,6 +281,8 @@ class SyncManager:
             # frozen and the pool looks bigger than it really is. Cutting is
             # still safe on incomplete data; granting is not.
             if any_unreadable and delta > 0:
+                logger.info("Not granting %ss to %s@%s: another host of this user "
+                            "couldn't be read this cycle", delta, user.username, account.host.ip)
                 continue
             if abs(delta) < threshold:
                 continue

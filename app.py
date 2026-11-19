@@ -87,43 +87,80 @@ def _format_hm(seconds):
 app.jinja_env.filters['hm'] = _format_hm
 
 
+def _today_day_limit(user, now):
+    return next((dl for dl in user.day_limits if dl.day_of_week == now.isoweekday()), None)
+
+
+def _app_time_left(user, now):
+    """What this app says is left today -- the source of truth hosts are
+    corrected towards: the pool target (today's limit + manual adjustment -
+    time spent across every host) capped by what remains of today's
+    allowed-hours window in the app's own schedule. None when the user has
+    no schedule configured."""
+    target = user.pool_target_seconds()
+    if target is None:
+        return None
+    today_dl = _today_day_limit(user, now)
+    if today_dl is not None:
+        window = allowed_seconds_remaining(today_dl.hour_tokens(), now)
+        if window is not None:
+            target = min(target, window)
+    return target
+
+
 def _time_left_summary(user, fresh_accounts, now=None):
     """(seconds, detail) for the "Time Left Today" figure.
 
-    seconds: MIN of each fresh account's effective_time_left() -- the host's
-    TIME_LEFT_DAY capped by what's left of the host's own allowed-hours
-    window today (see Account.effective_time_left). Why MIN: a multi-host
-    user shares one pool, so the lowest figure is always the freshest -- an
-    idle sibling that hasn't been corrected yet still shows the full day's
-    budget. None when no fresh account reports anything.
+    seconds: the app's own figure (_app_time_left) -- the app is the source
+    of truth and hosts get corrected to match it by the sync loop. A fresh
+    host whose TIME_LEFT_DAY differs from it by more than the propagation
+    threshold is named in the detail as pending correction, so a host that
+    doesn't obey stays visible. Only when the user has no schedule at all
+    does this fall back to the hosts' figures (MIN of effective_time_left,
+    since a multi-host user shares one pool). None when nothing is known.
 
     detail: context shown in parentheses. If the allowed-hours window is
     what's binding, "until HH:MM"; otherwise the schedule limit plus/minus
-    any manual adjustment (locally computed intent, not ground truth -- it
-    just explains *why* the total is what it is).
+    any manual adjustment. Followed by any pending-correction hosts.
     """
     now = now or datetime.now()
-    best = None  # (effective, raw, account)
-    for a in fresh_accounts:
-        eff = a.effective_time_left(now)
-        if eff is not None and (best is None or eff < best[0]):
-            best = (eff, a.time_left(), a)
-    if best is None:
-        seconds = None
-    else:
-        seconds = best[0]
-        if best[0] < best[1]:
-            end = allowed_window_end(best[2].today_allowed_hours(now), now)
-            if end is not None:
-                return seconds, f"until {format_clock(end)}"
+    seconds = _app_time_left(user, now)
+    parts = []
 
-    today_limit = user.today_limit_seconds()
-    bonus_seconds = user.today_bonus_seconds()
-    detail = None
-    if bonus_seconds and today_limit is not None:
-        sign = '+' if bonus_seconds > 0 else '-'
-        detail = f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}"
-    return seconds, detail
+    if seconds is None:
+        best = None  # (effective, raw, account)
+        for a in fresh_accounts:
+            eff = a.effective_time_left(now)
+            if eff is not None and (best is None or eff < best[0]):
+                best = (eff, a.time_left(), a)
+        if best is not None:
+            seconds = best[0]
+            if best[0] < best[1]:
+                end = allowed_window_end(best[2].today_allowed_hours(now), now)
+                if end is not None:
+                    parts.append(f"until {format_clock(end)}")
+    else:
+        pool = user.pool_target_seconds()
+        today_dl = _today_day_limit(user, now)
+        if seconds < pool and today_dl is not None:
+            end = allowed_window_end(today_dl.hour_tokens(), now)
+            if end is not None:
+                parts.append(f"until {format_clock(end)}")
+
+        threshold = Settings.get_int('PROPAGATION_THRESHOLD', SyncManager.PROPAGATION_THRESHOLD_DEFAULT)
+        for a in fresh_accounts:
+            host_left = a.time_left()
+            if host_left is not None and abs(max(0, host_left) - pool) >= threshold:
+                parts.append(f"{a.host.ip}: {_format_hm(max(0, host_left))}, pending correction")
+
+    if not any(p.startswith('until ') for p in parts):
+        today_limit = user.today_limit_seconds()
+        bonus_seconds = user.today_bonus_seconds()
+        if bonus_seconds and today_limit is not None:
+            sign = '+' if bonus_seconds > 0 else '-'
+            parts.insert(0, f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}")
+
+    return seconds, ('; '.join(parts) or None)
 
 
 # ---------------------------------------------------------------- auth
@@ -183,7 +220,9 @@ def dashboard():
                 dates = list(usage.keys())
             per_host_values.append({'ip': a.host.ip, 'hours': [v / 3600.0 for v in usage.values()]})
 
-        # Ground truth: what the hosts themselves report. Excluded: a stale
+        # The figure itself is the app's own (see _time_left_summary); the
+        # fresh hosts are only used to flag ones pending correction, or as a
+        # fallback when there's no schedule. Excluded: a stale
         # account (no successful read in the last 3 min) and one currently
         # offline in the sync loop's own backoff tracking -- that second check
         # matters because a host that *just* went offline is still "fresh" by
@@ -195,17 +234,9 @@ def dashboard():
         enforced_time_left, time_left_detail = _time_left_summary(user, fresh_accounts, now)
         global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Offline"
 
-        # Feeds only the chart's "remaining today" bar segment -- not shown as
-        # its own number, since it mostly restates global_time_left above.
-        # Capped by today's allowed-hours window (from the local schedule,
-        # like the rest of this figure) so the bar agrees with the number.
-        pool_target = user.pool_target_seconds()
-        if pool_target is not None:
-            today_dl = next((dl for dl in user.day_limits if dl.day_of_week == now.isoweekday()), None)
-            if today_dl is not None:
-                window = allowed_seconds_remaining(today_dl.hour_tokens(), now)
-                if window is not None:
-                    pool_target = min(pool_target, window)
+        # Feeds the chart's "remaining today" bar segment -- the same figure
+        # as global_time_left above, so the bar agrees with the number.
+        pool_target = _app_time_left(user, now)
 
         # Only a genuine, persistent mismatch on a reachable host is an alarm.
         # A host that's merely offline is normal -- it catches up once it's

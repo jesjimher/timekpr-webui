@@ -51,8 +51,10 @@ templates/          — Jinja2 HTML templates
    using data already fetched — this costs no extra SSH. `is_synced` only means "we sent it"; a
    mismatch here sets `ManagedUser.drift_detail`, triggers one rate-limited automatic re-push, and
    turns the dashboard card red. `limits_verified_at` means "the host's own config confirmed it".
-   The dashboard's "Time Left Today" is read from the host's reported `TIME_LEFT_DAY`, never
-   computed locally — a locally-computed number can't reveal a limit that silently failed to apply.
+   The app is the source of truth for time left: the dashboard's "Time Left Today" is the app's
+   own figure (today's limit + manual adjustment − time spent on all hosts, capped by today's
+   allowed-hours window). Hosts are corrected towards it by the sync loop; a host whose reported
+   `TIME_LEFT_DAY` differs by more than the propagation threshold is shown as "pending correction".
 
 ### Command budget (read before touching ssh_helper.py or task_manager.py)
 

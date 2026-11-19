@@ -289,3 +289,53 @@ def test_effective_time_left_without_hours_key(app):
 def test_effective_time_left_window_larger_than_budget(app):
     a = _account_with_config({'TIME_LEFT_DAY': 3600, 'ALLOWED_HOURS_2': [str(h) for h in range(24)]})
     assert a.effective_time_left(TUESDAY_1930) == 3600
+
+
+# ---------------------------------------------------------------- app is the source of truth for time left
+
+from app import _time_left_summary
+
+THURSDAY_2147 = datetime(2026, 11, 19, 21, 47)
+
+
+def _guillem_thursday(hours_enabled=False, end_hour=22, end_minute=30):
+    user, h1, h2, a1, a2 = _make_user_with_two_hosts()
+    for d in range(1, 8):
+        db.session.add(DayLimit(user_id=user.id, day_of_week=d, limit_seconds=4500,
+                                hours_enabled=hours_enabled, start_hour=9, start_minute=0,
+                                end_hour=end_hour, end_minute=end_minute))
+    db.session.add(Usage(account_id=a1.id, date=date.today(), seconds=4494))
+    db.session.add(TimeBonus(user_id=user.id, date=date.today(), seconds=2160))
+    db.session.commit()
+    return user, a1, a2
+
+
+def _set_left(account, seconds):
+    account.last_config = json.dumps({'TIME_LEFT_DAY': seconds})
+    db.session.commit()
+
+
+def test_summary_uses_app_figure_and_flags_lagging_host(app):
+    user, a1, a2 = _guillem_thursday()
+    _set_left(a1, 2160)
+    _set_left(a2, 0)
+    seconds, detail = _time_left_summary(user, [a1, a2], THURSDAY_2147)
+    assert seconds == 4500 + 2160 - 4494
+    assert 'menjador.local: 0h 0m, pending correction' in detail
+    assert 'athlon.local' not in detail
+
+
+def test_summary_window_caps_and_says_until(app):
+    user, a1, a2 = _guillem_thursday(hours_enabled=True, end_hour=22, end_minute=0)
+    _set_left(a1, 2160)
+    seconds, detail = _time_left_summary(user, [a1], THURSDAY_2147)
+    assert seconds == 13 * 60
+    assert detail.startswith('until 22:00')
+
+
+def test_summary_without_schedule_falls_back_to_hosts(app):
+    user, h1, h2, a1, a2 = _make_user_with_two_hosts()
+    _set_left(a1, 1200)
+    _set_left(a2, 600)
+    seconds, detail = _time_left_summary(user, [a1, a2], THURSDAY_2147)
+    assert seconds == 600 and detail is None
