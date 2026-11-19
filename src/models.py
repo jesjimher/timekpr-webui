@@ -95,6 +95,88 @@ def enforced_limits_from_config(config):
     return result
 
 
+def _allowed_intervals(tokens):
+    """Parse a timekpr ALLOWED_HOURS_<day> value into merged, sorted
+    [start, end) intervals in seconds since midnight.
+
+    Token forms: 'h' (the whole hour) and 'h[a-b]' (minutes a..b of hour h;
+    b == 59 means up to the end of the hour, which is how
+    DayLimit.hour_tokens() encodes a window running into the next hour).
+    Accepts a list or a single scalar, like config_mismatch_detail does.
+    Returns None if any token is unparseable -- callers then don't cap,
+    rather than display an invented number.
+    """
+    if tokens is None:
+        return None
+    if not isinstance(tokens, list):
+        tokens = [tokens]
+    intervals = []
+    for raw in tokens:
+        tok = str(raw).strip()
+        if not tok:
+            continue
+        try:
+            if '[' in tok:
+                hour_part, rest = tok.split('[', 1)
+                if not rest.endswith(']'):
+                    return None
+                a, b = rest[:-1].split('-', 1)
+                h, a, b = int(hour_part), int(a), int(b)
+                if b == 59:
+                    b = 60
+            else:
+                h, a, b = int(tok), 0, 60
+        except ValueError:
+            return None
+        if not (0 <= h <= 23 and 0 <= a < b <= 60):
+            return None
+        intervals.append((h * 3600 + a * 60, h * 3600 + b * 60))
+
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _seconds_since_midnight(now):
+    return now.hour * 3600 + now.minute * 60 + now.second
+
+
+def allowed_seconds_remaining(tokens, now):
+    """Seconds of allowed time left today from `now` on, per an
+    ALLOWED_HOURS_<day> value. Sums every remaining window, not only the
+    current one -- a later window today is still usable. None if the value
+    can't be parsed."""
+    intervals = _allowed_intervals(tokens)
+    if intervals is None:
+        return None
+    t = _seconds_since_midnight(now)
+    return sum(max(0, end - max(start, t)) for start, end in intervals)
+
+
+def allowed_window_end(tokens, now):
+    """End (seconds since midnight) of the allowed window `now` is in, or of
+    the next one today; None if there's none left or the value can't be
+    parsed."""
+    intervals = _allowed_intervals(tokens)
+    if not intervals:
+        return None
+    t = _seconds_since_midnight(now)
+    for _, end in intervals:
+        if end > t:
+            return end
+    return None
+
+
+def format_clock(seconds_since_midnight):
+    h, rem = divmod(int(seconds_since_midnight), 3600)
+    return f"{h:02d}:{rem // 60:02d}"
+
+
 def _format_seconds(seconds):
     h, rem = divmod(max(0, int(seconds)), 3600)
     m = rem // 60
@@ -397,7 +479,31 @@ class Account(db.Model):
         return None if limits is None else limits.get(date.today().isoweekday())
 
     def time_left(self):
+        """Raw TIME_LEFT_DAY as the host reports it: the daily budget left,
+        ignoring allowed hours. The sync loop relies on this raw figure --
+        use effective_time_left() for display."""
         return coerce_int(self.config_value('TIME_LEFT_DAY'))
+
+    def today_allowed_hours(self, now=None):
+        """The host's own ALLOWED_HOURS_<today> value, or None."""
+        now = now or datetime.now()
+        return self.config_value(f'ALLOWED_HOURS_{now.isoweekday()}')
+
+    def effective_time_left(self, now=None):
+        """What can really still be used today: the host's TIME_LEFT_DAY,
+        capped by what remains of the host's own allowed-hours window for
+        today. Both come from the host's last --userinfo read, so this stays
+        host-reported -- a window that silently failed to apply on the host
+        doesn't cap anything here. Falls back to the raw figure when the
+        host doesn't report (parseable) allowed hours."""
+        left = self.time_left()
+        if left is None:
+            return None
+        now = now or datetime.now()
+        window = allowed_seconds_remaining(self.today_allowed_hours(now), now)
+        if window is None:
+            return left
+        return max(0, min(left, window))
 
     def is_stale(self, max_age=STALE_AFTER):
         if not self.last_synced:

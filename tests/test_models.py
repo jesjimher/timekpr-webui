@@ -222,3 +222,70 @@ def test_mismatch_detail_ok_with_blocked_day_sent_as_zero(app):
     })
     ok, detail = config_mismatch_detail(user, a1)
     assert ok is True and detail is None
+
+
+# ---------------------------------------------------------------- allowed-hours cap on time left
+
+from datetime import datetime
+
+from src.models import allowed_seconds_remaining, allowed_window_end
+
+# 2026-11-17 is a Tuesday (isoweekday 2).
+TUESDAY_1930 = datetime(2026, 11, 17, 19, 30)
+UNTIL_20 = [str(h) for h in range(9, 20)]  # 09:00-20:00
+
+
+def test_allowed_remaining_full_day():
+    assert allowed_seconds_remaining([str(h) for h in range(24)], TUESDAY_1930) == 4.5 * 3600
+
+
+def test_allowed_remaining_window_ending_at_20():
+    assert allowed_seconds_remaining(UNTIL_20, TUESDAY_1930) == 1800
+
+
+def test_allowed_remaining_partial_end_hour():
+    assert allowed_seconds_remaining(['18', '19[0-45]'], TUESDAY_1930) == 15 * 60
+
+
+def test_allowed_remaining_after_window_is_zero():
+    assert allowed_seconds_remaining(['9', '10'], TUESDAY_1930) == 0
+
+
+def test_allowed_remaining_before_window_counts_whole_window():
+    now = datetime(2026, 11, 17, 7, 0)
+    assert allowed_seconds_remaining(['9[30-59]', '10', '11[0-15]'], now) == (30 + 60 + 15) * 60
+
+
+def test_allowed_remaining_scalar_and_garbage():
+    assert allowed_seconds_remaining('19', TUESDAY_1930) == 1800
+    assert allowed_seconds_remaining(['19', 'x'], TUESDAY_1930) is None
+    assert allowed_seconds_remaining(None, TUESDAY_1930) is None
+
+
+def test_allowed_window_end():
+    assert allowed_window_end(UNTIL_20, TUESDAY_1930) == 20 * 3600
+    assert allowed_window_end(['9', '10'], TUESDAY_1930) is None
+    assert allowed_window_end(['9', '21[0-30]'], TUESDAY_1930) == 21 * 3600 + 30 * 60
+
+
+def _account_with_config(cfg):
+    _, _, _, a1, _ = _make_user_with_two_hosts()
+    a1.last_config = json.dumps(cfg)
+    db.session.commit()
+    return a1
+
+
+def test_effective_time_left_capped_by_window(app):
+    a = _account_with_config({'TIME_LEFT_DAY': 3600, 'ALLOWED_HOURS_2': UNTIL_20})
+    assert a.time_left() == 3600
+    assert a.effective_time_left(TUESDAY_1930) == 1800
+
+
+def test_effective_time_left_without_hours_key(app):
+    a = _account_with_config({'TIME_LEFT_DAY': 3600})
+    assert a.effective_time_left(TUESDAY_1930) == 3600
+
+
+def test_effective_time_left_window_larger_than_budget(app):
+    a = _account_with_config({'TIME_LEFT_DAY': 3600, 'ALLOWED_HOURS_2': [str(h) for h in range(24)]})
+    assert a.effective_time_left(TUESDAY_1930) == 3600

@@ -8,6 +8,7 @@ import pytz
 from src.models import (
     db, User, Host, Account, Usage, Settings,
     coerce_time_spent_day, config_mismatch_detail,
+    allowed_seconds_remaining, allowed_window_end, format_clock,
 )
 from src.timekpr import SSHClient
 from src.sync import SyncManager
@@ -86,6 +87,45 @@ def _format_hm(seconds):
 app.jinja_env.filters['hm'] = _format_hm
 
 
+def _time_left_summary(user, fresh_accounts, now=None):
+    """(seconds, detail) for the "Time Left Today" figure.
+
+    seconds: MIN of each fresh account's effective_time_left() -- the host's
+    TIME_LEFT_DAY capped by what's left of the host's own allowed-hours
+    window today (see Account.effective_time_left). Why MIN: a multi-host
+    user shares one pool, so the lowest figure is always the freshest -- an
+    idle sibling that hasn't been corrected yet still shows the full day's
+    budget. None when no fresh account reports anything.
+
+    detail: context shown in parentheses. If the allowed-hours window is
+    what's binding, "until HH:MM"; otherwise the schedule limit plus/minus
+    any manual adjustment (locally computed intent, not ground truth -- it
+    just explains *why* the total is what it is).
+    """
+    now = now or datetime.now()
+    best = None  # (effective, raw, account)
+    for a in fresh_accounts:
+        eff = a.effective_time_left(now)
+        if eff is not None and (best is None or eff < best[0]):
+            best = (eff, a.time_left(), a)
+    if best is None:
+        seconds = None
+    else:
+        seconds = best[0]
+        if best[0] < best[1]:
+            end = allowed_window_end(best[2].today_allowed_hours(now), now)
+            if end is not None:
+                return seconds, f"until {format_clock(end)}"
+
+    today_limit = user.today_limit_seconds()
+    bonus_seconds = user.today_bonus_seconds()
+    detail = None
+    if bonus_seconds and today_limit is not None:
+        sign = '+' if bonus_seconds > 0 else '-'
+        detail = f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}"
+    return seconds, detail
+
+
 # ---------------------------------------------------------------- auth
 
 @app.route('/', methods=['GET', 'POST'])
@@ -150,34 +190,22 @@ def dashboard():
         # the 3-minute clock, so without it, a machine that's now off keeps
         # contributing its last (real, but frozen) reading to the number below
         # even though nobody can possibly be using it right now.
-        #
-        # Take the MIN, not the max, across what's left: a multi-host user
-        # shares one pool, so the lowest figure is always the freshest -- an
-        # idle sibling that hasn't been corrected yet still shows the full
-        # day's budget, and picking the max would flash that stale, optimistic
-        # number instead of what the host actually in use is really counting
-        # down to.
+        now = datetime.now()
         fresh_accounts = [a for a in accounts if not a.is_stale() and a.host.ip not in offline]
-        left_values = [v for v in (a.time_left() for a in fresh_accounts) if v is not None]
-        enforced_time_left = min(left_values) if left_values else None
+        enforced_time_left, time_left_detail = _time_left_summary(user, fresh_accounts, now)
         global_time_left = _format_hm(enforced_time_left) if enforced_time_left is not None else "Offline"
 
         # Feeds only the chart's "remaining today" bar segment -- not shown as
         # its own number, since it mostly restates global_time_left above.
+        # Capped by today's allowed-hours window (from the local schedule,
+        # like the rest of this figure) so the bar agrees with the number.
         pool_target = user.pool_target_seconds()
-
-        # Breakdown shown in parentheses next to the total: schedule limit
-        # for today plus/minus any manual adjustment. This is locally
-        # computed intent, not the ground truth itself (global_time_left
-        # above stays host-reported per Invariant 2) -- it's just context so
-        # a parent can see *why* the total is what it is instead of only
-        # getting an unexplained "adjustment active" badge.
-        today_limit = user.today_limit_seconds()
-        bonus_seconds = user.today_bonus_seconds()
-        time_left_detail = None
-        if bonus_seconds and today_limit is not None:
-            sign = '+' if bonus_seconds > 0 else '-'
-            time_left_detail = f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}"
+        if pool_target is not None:
+            today_dl = next((dl for dl in user.day_limits if dl.day_of_week == now.isoweekday()), None)
+            if today_dl is not None:
+                window = allowed_seconds_remaining(today_dl.hour_tokens(), now)
+                if window is not None:
+                    pool_target = min(pool_target, window)
 
         # Only a genuine, persistent mismatch on a reachable host is an alarm.
         # A host that's merely offline is normal -- it catches up once it's
@@ -468,18 +496,9 @@ def api_status():
                 if detail:
                     drift_details.append(f"{a.host.ip}: {detail}")
 
-        # MIN across non-stale, non-offline accounts -- see dashboard() above.
+        # Non-stale, non-offline accounts only -- see dashboard() above.
         fresh = [a for a in accounts if not a.is_stale() and a.host.ip not in offline]
-        left_values = [v for v in (a.time_left() for a in fresh) if v is not None]
-        time_left = min(left_values) if left_values else None
-
-        # Breakdown shown in parentheses next to the total -- see dashboard() above.
-        today_limit = user.today_limit_seconds()
-        bonus_seconds = user.today_bonus_seconds()
-        time_left_detail = None
-        if bonus_seconds and today_limit is not None:
-            sign = '+' if bonus_seconds > 0 else '-'
-            time_left_detail = f"{_format_hm(today_limit)} {sign} {_format_hm(abs(bonus_seconds))}"
+        time_left, time_left_detail = _time_left_summary(user, fresh)
 
         users_payload[user.username] = {
             'verification': verification,
